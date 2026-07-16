@@ -1,49 +1,58 @@
-import ccxt, pandas as pd, pandas_ta as ta, time, os, telebot
+import ccxt, pandas as pd, pandas_ta as ta, time, telebot, os
 
-# सेटिंग्स
-exchange = ccxt.delta({'apiKey': os.environ.get('API_KEY'), 'secret': os.environ.get('API_SECRET')})
+# Telegram और Exchange Setup
 bot = telebot.TeleBot(os.environ.get('TELEGRAM_BOT_TOKEN'))
-CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID')
-
-SYMBOLS = ['BTC/USDT', 'ETH/USDT']
-active_positions = {}
+exchange = ccxt.delta({'apiKey': os.environ.get('API_KEY'), 'secret': os.environ.get('API_SECRET')})
 
 def get_data(symbol):
-    try:
-        bars = exchange.fetch_ohlcv(symbol, timeframe='5m', limit=50)
-        df = pd.DataFrame(bars, columns=['t', 'o', 'h', 'l', 'c', 'v'])
-        
-        # 7 इंडिकेटर्स
-        df['vwap'] = ta.vwap(df['h'], df['l'], df['c'], df['v'])
-        df['tema9'] = ta.tema(df['c'], length=9)
-        st = ta.supertrend(df['h'], df['l'], df['c'], length=10, multiplier=3)
-        df['st'] = st['SUPERT_10_3.0']
-        df['rsi'] = ta.rsi(df['c'], length=14)
-        df['adx'] = ta.adx(df['h'], df['l'], df['c'], length=14)['ADX_14']
-        df['cmf'] = ta.cmf(df['h'], df['l'], df['c'], df['v'], length=20)
-        
-        return df.iloc[-1]
-    except: return None
+    bars = exchange.fetch_ohlcv(symbol, timeframe='5m', limit=100)
+    df = pd.DataFrame(bars, columns=['t', 'o', 'h', 'l', 'c', 'v'])
+    
+    # 1. इंडिकेटर कैलकुलेशन
+    df['ema_9'] = ta.ema(df['c'], length=9)
+    df['ema_21'] = ta.ema(df['c'], length=21)
+    st = ta.supertrend(df['h'], df['l'], df['c'], length=10, multiplier=3)
+    df['supertrend'] = st['SUPERT_10_3.0']
+    df['adx'] = ta.adx(df['h'], df['l'], df['c'], length=14)['ADX_14']
+    df['rsi'] = ta.rsi(df['c'], length=14)
+    df['cmf'] = ta.cmf(df['h'], df['l'], df['c'], df['v'], length=20)
+    df['atr'] = ta.atr(df['h'], df['l'], df['c'], length=14)
+    return df
 
-def run_bot():
-    for symbol in SYMBOLS:
-        data = get_data(symbol)
-        if data is None: continue
-        
-        # 6 एंट्री शर्तें
-        is_buy = (data['c'] > data['vwap']) and (data['c'] > data['tema9']) and (data['st'] < data['c']) and (data['rsi'] > 50) and (data['adx'] > 25) and (data['cmf'] > 0)
-        is_sell = (data['c'] < data['vwap']) and (data['c'] < data['tema9']) and (data['st'] > data['c']) and (data['rsi'] < 50) and (data['adx'] > 25) and (data['cmf'] < 0)
+def trade_logic():
+    for symbol in ['BTC/USDT', 'ETH/USDT']:
+        try:
+            df = get_data(symbol)
+            last = df.iloc[-1]
+            price = last['c']
+            
+            # 2. नियम लागू करना
+            is_buy = (last['adx'] > 25) and (last['rsi'] > 50) and (last['cmf'] > 0) and \
+                     (last['ema_9'] > last['ema_21']) and (last['c'] > last['supertrend'])
+                     
+            is_sell = (last['adx'] > 25) and (last['rsi'] < 50) and (last['cmf'] < 0) and \
+                      (last['ema_9'] < last['ema_21']) and (last['c'] < last['supertrend'])
 
-        if symbol not in active_positions:
+            # 3. लॉट साइज और लेवरेज (1-10 लॉट, 25x)
+            balance = exchange.fetch_balance()['USDT']['free']
+            lot_size = min(10, max(1, int((balance * 25) / price)))
+            
             if is_buy or is_sell:
-                side = 'BUY' if is_buy else 'SELL'
-                msg = f"🚀 Prime Scalp Signal: {symbol} | {side} @ {data['c']:.2f}"
-                bot.send_message(CHAT_ID, msg)
-                active_positions[symbol] = {'side': side}
+                side = 'buy' if is_buy else 'sell'
+                sl = price - (last['atr'] * 2) if is_buy else price + (last['atr'] * 2)
+                tp = price + (last['atr'] * 4) if is_buy else price - (last['atr'] * 4)
+                
+                params = {'leverage': 25, 'stopLoss': sl, 'takeProfit': tp}
+                exchange.create_order(symbol, 'market', side, lot_size, params=params)
+                bot.send_message(os.environ.get('TELEGRAM_CHAT_ID'), f"✅ ट्रेड लिया गया: {side.upper()} {symbol}\nलॉट: {lot_size}\nSL: {sl:.2f}\nTP: {tp:.2f}")
 
+        except Exception as e:
+            print(f"Error in {symbol}: {e}")
+
+# 4. क्रैश-प्रूफ वॉचडॉग लूप
 while True:
-    try: run_bot()
-    except Exception as e: print(e)
-    time.sleep(60)
-
-        
+    try:
+        trade_logic()
+    except Exception as e:
+        print(f"Watchdog Alert: {e}")
+    time.sleep(60) # 1 मिनट का अंतराल
