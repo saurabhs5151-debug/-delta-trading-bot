@@ -1,11 +1,11 @@
+import os
+import time
 import ccxt
 import pandas as pd
 import pandas_ta as ta
-import time
-import telebot  # यह तब काम करेगा जब requirements.txt में pyTelegramBotAPI होगा
-import os
+import telebot
 
-# कॉन्फ़िगरेशन
+# बोट सेटअप
 bot = telebot.TeleBot(os.environ.get('TELEGRAM_BOT_TOKEN'))
 exchange = ccxt.delta({'apiKey': os.environ.get('API_KEY'), 'secret': os.environ.get('API_SECRET')})
 active_trades = {}
@@ -32,15 +32,16 @@ while True:
     try:
         balance = exchange.fetch_balance()['USDT']['free']
         for symbol in ['BTC/USDT', 'ETH/USDT']:
-            
+            # एग्जिट लॉजिक (29 मिनट बाद मार्केट ऑर्डर - टेकर)
             if symbol in active_trades:
                 if (time.time() - active_trades[symbol]['time']) > 1740:
                     side = 'sell' if active_trades[symbol]['side'] == 'buy' else 'buy'
                     exchange.create_order(symbol, 'market', side, active_trades[symbol]['lot'])
                     del active_trades[symbol]
-                    bot.send_message(os.environ.get('TELEGRAM_CHAT_ID'), f"⏱️ 29 मिनट पूर्ण, {symbol} क्लोज किया।")
+                    bot.send_message(os.environ.get('TELEGRAM_CHAT_ID'), f"⏱️ 29 मिनट पूरे, {symbol} मार्केट ऑर्डर से क्लोज किया।")
                 continue
 
+            # एंट्री लॉजिक (लिमिट ऑर्डर - मेकर)
             df = get_data(symbol)
             last = df.iloc[-1]
             price = last['c']
@@ -53,11 +54,10 @@ while True:
                 tp = price + (last['atr'] * 3)
                 lot = calculate_lot(symbol, balance)
                 
+                # लिमिट ऑर्डर (मेकर ऑर्डर)
                 exchange.create_order(symbol, 'limit', 'buy', lot, price, {'leverage': 25, 'stopLoss': sl, 'takeProfit': tp})
                 active_trades[symbol] = {'time': time.time(), 'side': 'buy', 'lot': lot}
-                bot.send_message(os.environ.get('TELEGRAM_CHAT_ID'), f"✅ {symbol} पर लिमिट बाय लगाई। SL: {round(sl,2)}, TP: {round(tp,2)}")
-
+                bot.send_message(os.environ.get('TELEGRAM_CHAT_ID'), f"✅ {symbol} पर लिमिट ऑर्डर लगाया। SL: {round(sl,2)}, TP: {round(tp,2)}")
     except Exception as e:
         print(f"System Error: {e}")
-    
     time.sleep(60)
