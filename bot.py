@@ -5,7 +5,7 @@ import pandas as pd
 import pandas_ta as ta
 import telebot
 
-# 1. SETUP & CONFIGURATION
+# ========== Setup ==========
 API_KEY = str(os.environ.get('API_KEY') or '').strip()
 API_SECRET = str(os.environ.get('API_SECRET') or '').strip()
 BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
@@ -13,16 +13,23 @@ CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID')
 
 bot = telebot.TeleBot(BOT_TOKEN)
 
-# Initialize Exchange
+# ========== Delta Exchange ==========
 exchange = ccxt.delta({
-    'apiKey': API_KEY, 
+    'apiKey': API_KEY,
     'secret': API_SECRET,
     'enableRateLimit': True,
-    'options': {'defaultType': 'future', 'adjustForTimeDifference': True}
+    'options': {
+        'defaultType': 'future',
+        'adjustForTimeDifference': True
+    },
+    'headers': {
+        'User-Agent': 'Mozilla/5.0'
+    }
 })
 
 active_trades = {}
 
+# ========== Helper Functions ==========
 def send_alert(msg):
     try:
         bot.send_message(CHAT_ID, msg, parse_mode='Markdown')
@@ -40,45 +47,82 @@ def get_data(symbol):
         df['supertrend'] = st['SUPERT_10_3.0']
         df['adx'] = ta.adx(df['h'], df['l'], df['c'], length=14)['ADX_14']
         df['rsi'] = ta.rsi(df['c'], length=14)
+        df['atr'] = ta.atr(df['h'], df['l'], df['c'], length=14)
+        df['cmf'] = ta.cmf(df['h'], df['l'], df['c'], df['v'], length=20)
         return df
     except Exception as e:
-        print(f"Data Error for {symbol}: {e}")
+        print(f"Data Error: {e}")
         return None
 
-# 3. MAIN TRADING LOOP
-print("🚀 BOT STARTED SUCCESSFULLY...")
+def calculate_lot(symbol, balance, price, leverage=25):
+    try:
+        lot = (balance * leverage) / price
+        # BTC/USDT और ETH/USDT के लिए न्यूनतम लॉट साइज
+        min_lot = 0.001 if 'BTC' in symbol else 0.01
+        return max(min_lot, round(lot, 3))
+    except:
+        return 0.001
+
+def check_api():
+    try:
+        exchange.fetch_balance()
+        return True
+    except Exception as e:
+        print(f"API Connection Check Failed: {e}")
+        return False
+
+# ========== Main Loop ==========
+print("🚀 Prime Scalp Bot Started (Delta - Verified)...")
 
 while True:
+    if not check_api():
+        time.sleep(30)
+        continue
+
     try:
         balance = exchange.fetch_balance()['USDT']['free']
-        print(f"💰 Current Balance: {balance}")
         
+        # ✅ सिम्बल्स में स्लैश (/) का उपयोग किया गया है (Delta के लिए अनिवार्य)
         for symbol in ['BTC/USDT', 'ETH/USDT']:
-            # Exit Logic
+            
+            # एग्जिट लॉजिक (29 मिनट)
             if symbol in active_trades:
                 if (time.time() - active_trades[symbol]['time']) > 1740:
                     side = 'sell' if active_trades[symbol]['side'] == 'buy' else 'buy'
-                    exchange.create_order(symbol, 'market', side, active_trades[symbol]['lot'])
-                    del active_trades[symbol]
-                    send_alert(f"⏱️ {symbol} Trade Closed.")
+                    try:
+                        exchange.create_order(symbol, 'market', side, active_trades[symbol]['lot'])
+                        del active_trades[symbol]
+                        send_alert(f"⏱️ {symbol} Closed.")
+                    except Exception as e:
+                        print(f"Exit Error: {e}")
                 continue
 
-            # Entry Logic
+            # एंट्री लॉजिक
             df = get_data(symbol)
             if df is None: continue
             
             last = df.iloc[-1]
-            print(f"📊 {symbol} | ADX: {last['adx']:.2f} | RSI: {last['rsi']:.2f}")
+            price = last['c']
 
-            is_buy = (last['adx'] > 25) and (last['rsi'] > 50) and (last['ema_9'] > last['ema_21']) and (last['c'] > last['supertrend'])
-            is_sell = (last['adx'] > 25) and (last['rsi'] < 50) and (last['ema_9'] < last['ema_21']) and (last['c'] < last['supertrend'])
+            # प्राइस अलर्ट (हर मिनट)
+            try:
+                bot.send_message(CHAT_ID, f"📈 {symbol} | Price: {price} | ATR: {round(last['atr'], 2)} | CMF: {round(last['cmf'], 2)}")
+            except: pass
+
+            # एंट्री कंडीशंस (ADX + CMF + SuperTrend)
+            is_buy = (last['adx'] > 25) and (last['cmf'] > 0) and (last['c'] > last['supertrend'])
+            is_sell = (last['adx'] > 25) and (last['cmf'] < 0) and (last['c'] < last['supertrend'])
 
             if (is_buy or is_sell) and symbol not in active_trades:
                 side = 'buy' if is_buy else 'sell'
-                lot = 0.001 if symbol == 'BTC/USDT' else 0.01
-                exchange.create_order(symbol, 'limit', side, lot, last['c'])
-                active_trades[symbol] = {'time': time.time(), 'side': side, 'lot': lot}
-                send_alert(f"✅ {symbol} {side.upper()} Entry!")
+                lot = calculate_lot(symbol, balance, price)
+                
+                try:
+                    exchange.create_order(symbol, 'market', side, lot)
+                    active_trades[symbol] = {'time': time.time(), 'side': side, 'lot': lot}
+                    send_alert(f"✅ {symbol} {side.upper()} Entry! LOT: {lot}")
+                except Exception as e:
+                    print(f"Entry Error: {e}")
 
     except Exception as e:
         print(f"Loop Error: {e}")
