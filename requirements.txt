@@ -1,6 +1,4 @@
 
 ccxt
 pandas
-telebot
-numpy
-
+pyTelegramBotAPI
