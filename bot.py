@@ -49,7 +49,8 @@ class PrimeScalpBot:
             'enableRateLimit': True,
             'options': {'defaultType': 'future', 'adjustForTimeDifference': True}
         })
-        self.symbols = ['BTC/USD', 'ETH/USD']
+        # सिंबल को डेल्टा फॉर्मेट में अपडेट किया गया है
+        self.symbols = ['BTCUSD', 'ETHUSD']
         self.BASE_LEVERAGE = 25
         self.MID_LEVERAGE = 15
         self.MIN_LEVERAGE = 5
