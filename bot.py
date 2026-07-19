@@ -1,6 +1,5 @@
 import ccxt
 import pandas as pd
-import pandas_ta as ta
 import os
 import time
 import json
@@ -33,6 +32,15 @@ def send_telegram(message):
         except Exception as e:
             logging.error(f"Telegram error: {e}")
 
+# ====== Pandas_ta import with fallback ======
+try:
+    import pandas_ta as ta
+    PANDAS_TA_AVAILABLE = True
+except ImportError:
+    PANDAS_TA_AVAILABLE = False
+    logging.warning("⚠️ pandas_ta not installed. Using basic EMA logic.")
+    ta = type('obj', (object,), {'ema': lambda s, l: s.ewm(span=l, adjust=False).mean()})()
+
 class PrimeScalpBot:
     def __init__(self):
         self.exchange = ccxt.delta({
@@ -46,7 +54,7 @@ class PrimeScalpBot:
         self.MID_LEVERAGE = 15
         self.MIN_LEVERAGE = 5
         self.LEVERAGE = 25
-        self.DAILY_LOSS_LIMIT = -600   # USD – Smart Throttle
+        self.DAILY_LOSS_LIMIT = -600
         self.daily_pnl = 0
         self.today_date = datetime.now().date()
         self.active_trades = {}
@@ -95,20 +103,32 @@ class PrimeScalpBot:
         try:
             bars = self.exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
             df = pd.DataFrame(bars, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-            df['tema'] = ta.tema(df['close'], length=9)
-            df['vwap'] = ta.vwap(df['high'], df['low'], df['close'], df['volume'])
-            st = ta.supertrend(df['high'], df['low'], df['close'], length=10, multiplier=3)
-            df['st'] = st.iloc[:, 0]
-            df['rsi'] = ta.rsi(df['close'], length=7)
-            df['adx'] = ta.adx(df['high'], df['low'], df['close'], length=20).iloc[:, 0]
-            df['cmf'] = ta.cmf(df['high'], df['low'], df['close'], df['volume'], length=10)
-            df['atr'] = ta.atr(df['high'], df['low'], df['close'], length=14)
+            
+            if PANDAS_TA_AVAILABLE:
+                df['tema'] = ta.tema(df['close'], length=9)
+                df['vwap'] = ta.vwap(df['high'], df['low'], df['close'], df['volume'])
+                st = ta.supertrend(df['high'], df['low'], df['close'], length=10, multiplier=3)
+                df['st'] = st.iloc[:, 0]
+                df['rsi'] = ta.rsi(df['close'], length=7)
+                df['adx'] = ta.adx(df['high'], df['low'], df['close'], length=20).iloc[:, 0]
+                df['cmf'] = ta.cmf(df['high'], df['low'], df['close'], df['volume'], length=10)
+                df['atr'] = ta.atr(df['high'], df['low'], df['close'], length=14)
+            else:
+                df['tema'] = df['close'].ewm(span=9, adjust=False).mean()
+                df['vwap'] = (df['high'] + df['low'] + df['close']) / 3
+                df['st'] = 1
+                df['rsi'] = 50
+                df['adx'] = 25
+                df['cmf'] = 0.1
+                df['atr'] = (df['high'] - df['low']).rolling(14).mean()
             return df
         except Exception as e:
             logging.error(f"Indicator Error ({symbol}): {e}")
             return None
 
     def check_entry(self, df):
+        if not PANDAS_TA_AVAILABLE:
+            return None
         last = df.iloc[-1]
         long_cond = (last['close'] > last['tema'] and last['close'] > last['vwap'] and last['st'] == 1 and last['rsi'] > 50 and last['adx'] > 20 and last['cmf'] > 0.05)
         short_cond = (last['close'] < last['tema'] and last['close'] < last['vwap'] and last['st'] == -1 and last['rsi'] < 50 and last['adx'] > 20 and last['cmf'] < -0.05)
@@ -140,7 +160,7 @@ class PrimeScalpBot:
         stage = trade.get('stage', 0)
         direction = trade['direction']
         entry = trade['entry_price']
-        atr = trade['atr']
+        atr = trade.get('atr', 1)
         remaining = trade['remaining_amount']
         qty_total = trade['total_amount']
 
@@ -186,6 +206,8 @@ class PrimeScalpBot:
                     trade['sl_price'] = new_sl
 
     def is_volatile_news(self, symbol):
+        if not PANDAS_TA_AVAILABLE:
+            return False
         df_1m = self.fetch_indicators(symbol, '1m', limit=20)
         if df_1m is None or len(df_1m) < 10:
             return False
@@ -218,6 +240,8 @@ class PrimeScalpBot:
             self.save_trade_state()
 
     def get_market_regime(self, symbol):
+        if not PANDAS_TA_AVAILABLE:
+            return self.LEVERAGE
         df = self.fetch_indicators(symbol, '5m', limit=50)
         if df is None or len(df) < 20:
             return self.LEVERAGE
@@ -312,7 +336,7 @@ class PrimeScalpBot:
                             signal_5m = self.check_entry(df_5m)
                             if signal_5m == self.pending_entry[symbol]['signal']:
                                 price = df_5m['close'].iloc[-1]
-                                atr = df_5m['atr'].iloc[-1]
+                                atr = df_5m.get('atr', [1]).iloc[-1] if 'atr' in df_5m else 1
                                 lot = self.calculate_lot(symbol, price)
                                 if lot > 0:
                                     side = 'buy' if signal_5m == 'long' else 'sell'
@@ -355,7 +379,7 @@ class PrimeScalpBot:
 
                         if (trade['direction'] == 'long' and current <= trade['sl_price']) or (trade['direction'] == 'short' and current >= trade['sl_price']):
                             send_telegram(f"🛑 SL Hit: {symbol}")
-                            logging.info(f"SL Hit: {symbol}")
+                            logging.info(f"🛑 SL Hit: {symbol}")
                             self.emergency_exit(symbol)
                             continue
 
