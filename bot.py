@@ -1,4 +1,4 @@
-import ccxt, pandas as pd, pandas_ta as ta, os, json, logging, telebot
+import ccxt, pandas as pd, pandas_ta as ta, os, json, logging, telebot, time
 from datetime import datetime
 from dotenv import load_dotenv
 
@@ -54,12 +54,13 @@ class PrimeScalpBot:
         atr = df['atr'].iloc[-1]
         entry = trade['entry_price']
         
-        # 1. टाइम एग्जिट (29 मिनट) -> 25% बाकी बुकिंग
+        # 1. टाइम एग्जिट (29 मिनट)
         if (datetime.now() - datetime.fromisoformat(trade['entry_time'])).total_seconds() > 1740:
+            self.send_telegram(f"⏳ {symbol} Time Exit Reached! Closing final 25% at {curr}.")
             self.execute_exit(symbol, "Time Exit (29m - Final 25%)")
             return
 
-        # 2. पहली 25% बुकिंग (ATR * 1.5) -> SL Breakeven
+        # 2. पहली 25% बुकिंग (ATR * 1.5)
         if trade['stage'] == 0:
             tp1 = (entry + (atr * 1.5)) if trade['side'] == 'long' else (entry - (atr * 1.5))
             if (trade['side'] == 'long' and curr >= tp1) or (trade['side'] == 'short' and curr <= tp1):
@@ -69,7 +70,7 @@ class PrimeScalpBot:
                 self.send_telegram(f"✅ {symbol} 25% Booked. SL Breakeven set at {entry}")
                 self.save_state()
 
-        # 3. दूसरी 50% बुकिंग (ATR * 2.5) -> SL Trail (ATR * 2.0)
+        # 3. दूसरी 50% बुकिंग (ATR * 2.5)
         elif trade['stage'] == 1:
             tp2 = (entry + (atr * 2.5)) if trade['side'] == 'long' else (entry - (atr * 2.5))
             if (trade['side'] == 'long' and curr >= tp2) or (trade['side'] == 'short' and curr <= tp2):
@@ -80,7 +81,6 @@ class PrimeScalpBot:
                 self.save_state()
 
     def partial_order(self, symbol, pct):
-        # मार्केट ऑर्डर से बुकिंग
         trade = self.state['trades'][symbol]
         qty = round(trade['total_amount'] * pct, 4)
         side = 'sell' if trade['side'] == 'long' else 'buy'
@@ -88,7 +88,6 @@ class PrimeScalpBot:
         trade['remaining_amount'] -= qty
 
     def execute_exit(self, symbol, reason):
-        self.send_telegram(f"🛑 Closing {symbol}: {reason}")
         trade = self.state['trades'][symbol]
         side = 'sell' if trade['side'] == 'long' else 'buy'
         self.exchange.create_market_order(symbol, side, trade['remaining_amount'])
@@ -96,7 +95,16 @@ class PrimeScalpBot:
         self.save_state()
 
     def run(self):
+        last_heartbeat = 0
         while True:
+            # 2 मिनट का हार्टबीट अलर्ट
+            if time.time() - last_heartbeat >= 120:
+                try:
+                    ticker = self.exchange.fetch_ticker(self.symbols[0])
+                    self.send_telegram(f"🕒 Bot Heartbeat | {self.symbols[0]}: {ticker['last']}")
+                    last_heartbeat = time.time()
+                except: pass
+
             for symbol in self.symbols:
                 if self.is_news_spike(symbol): continue
                 df = self.fetch_indicators(symbol)
@@ -105,13 +113,13 @@ class PrimeScalpBot:
                     signal = self.check_filters(df)
                     if signal:
                         price = df['close'].iloc[-1]
-                        lot = 0.01 # अपनी लॉट साइज सेट करें
+                        lot = 0.01 
                         self.exchange.create_order(symbol, 'limit', 'buy' if signal == 'long' else 'sell', lot, price, {'postOnly': True})
                         self.state['trades'][symbol] = {'side': signal, 'entry_price': price, 'total_amount': lot, 'remaining_amount': lot, 'stage': 0, 'entry_time': datetime.now().isoformat()}
                         self.send_telegram(f"⚡ {signal.upper()} Entry {symbol} @ {price}")
                 else:
                     self.manage_trade(symbol, self.state['trades'][symbol], df)
-            import time; time.sleep(10)
+            time.sleep(10)
 
 if __name__ == "__main__":
     PrimeScalpBot().run()
