@@ -144,8 +144,21 @@ class PrimeScalpBot:
         if not PANDAS_TA_AVAILABLE or df is None or len(df) == 0:
             return None
         last = df.iloc[-1]
-        long_cond = (last['close'] > last['tema'] and last['close'] > last['vwap'] and last['st'] == 1 and last['rsi'] > 50 and last['adx'] > 20 and last['cmf'] > 0.05)
-        short_cond = (last['close'] < last['tema'] and last['close'] < last['vwap'] and last['st'] == -1 and last['rsi'] < 50 and last['adx'] > 20 and last['cmf'] < -0.05)
+        
+        # Safe extraction with None protection
+        close = last.get('close')
+        tema = last.get('tema')
+        vwap = last.get('vwap')
+        st = last.get('st', 1)
+        rsi = last.get('rsi')
+        adx = last.get('adx')
+        cmf = last.get('cmf')
+        
+        if any(v is None for v in [close, tema, vwap, rsi, adx, cmf]):
+            return None
+
+        long_cond = (close > tema and close > vwap and st == 1 and rsi > 50 and adx > 20 and cmf > 0.05)
+        short_cond = (close < tema and close < vwap and st == -1 and rsi < 50 and adx > 20 and cmf < -0.05)
         return 'long' if long_cond else 'short' if short_cond else None
 
     def place_order(self, symbol, side, amount, price):
@@ -260,6 +273,8 @@ class PrimeScalpBot:
         if df is None or len(df) < 20:
             return self.LEVERAGE
         latest_adx = df['adx'].iloc[-1]
+        if latest_adx is None:
+            return self.LEVERAGE
         if latest_adx > 25:
             return self.BASE_LEVERAGE
         elif latest_adx < 20:
