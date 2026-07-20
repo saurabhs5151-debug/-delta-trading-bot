@@ -102,6 +102,8 @@ class PrimeScalpBot:
     def fetch_indicators(self, symbol, timeframe='5m', limit=100):
         try:
             bars = self.exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+            if not bars:
+                return None
             df = pd.DataFrame(bars, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
             
             # Fix for VWAP and DatetimeIndex warning
@@ -131,7 +133,7 @@ class PrimeScalpBot:
             return None
 
     def check_entry(self, df):
-        if not PANDAS_TA_AVAILABLE:
+        if not PANDAS_TA_AVAILABLE or df is None or len(df) == 0:
             return None
         last = df.iloc[-1]
         long_cond = (last['close'] > last['tema'] and last['close'] > last['vwap'] and last['st'] == 1 and last['rsi'] > 50 and last['adx'] > 20 and last['cmf'] > 0.05)
@@ -229,7 +231,7 @@ class PrimeScalpBot:
             trade = self.active_trades[symbol]
             try:
                 df = self.fetch_indicators(symbol, '1m', limit=1)
-                if df is not None:
+                if df is not None and len(df) > 0:
                     current = df['close'].iloc[-1]
                     pnl = (current - trade['entry_price']) * trade['remaining_amount'] if trade['direction'] == 'long' else (trade['entry_price'] - current) * trade['remaining_amount']
                     self.daily_pnl += pnl
@@ -263,7 +265,7 @@ class PrimeScalpBot:
             return 'exit'
         df_1m = self.fetch_indicators(symbol, '1m', limit=10)
         df_5m = self.fetch_indicators(symbol, '5m', limit=5)
-        if df_1m is not None and df_5m is not None:
+        if df_1m is not None and df_5m is not None and len(df_1m) > 0 and len(df_5m) > 0:
             if df_1m['high'].iloc[-1] > df_5m['high'].max() or df_1m['low'].iloc[-1] < df_5m['low'].min():
                 return 'emergency'
         if df_1m is not None and len(df_1m) >= 5:
@@ -323,10 +325,9 @@ class PrimeScalpBot:
 
                 for symbol in self.symbols:
                     df_1m = self.fetch_indicators(symbol, '1m', limit=20)
-                    if df_1m is None:
+                    if df_1m is None or len(df_1m) == 0:
                         continue
                     
-                    # Since index is now datetime, get the last timestamp safely
                     last_ts = str(df_1m.index[-1])
                     if self.last_alert_time.get(symbol) != last_ts:
                         self.last_alert_time[symbol] = last_ts
@@ -338,7 +339,7 @@ class PrimeScalpBot:
 
                     if self.pending_entry.get(symbol) and symbol not in self.active_trades:
                         df_5m = self.fetch_indicators(symbol, '5m', limit=50)
-                        if df_5m is not None:
+                        if df_5m is not None and len(df_5m) > 0:
                             signal_5m = self.check_entry(df_5m)
                             if signal_5m == self.pending_entry[symbol]['signal']:
                                 price = df_5m['close'].iloc[-1]
@@ -371,7 +372,7 @@ class PrimeScalpBot:
                     if symbol in self.active_trades:
                         trade = self.active_trades[symbol]
                         df_price = self.fetch_indicators(symbol, '1m', limit=1)
-                        if df_price is None:
+                        if df_price is None or len(df_price) == 0:
                             continue
                         current = df_price['close'].iloc[-1]
 
