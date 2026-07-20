@@ -1,96 +1,117 @@
-import ccxt
-import pandas as pd
-import os
-import time
-import json
-import logging
-import telebot
+import ccxt, pandas as pd, pandas_ta as ta, os, json, logging, telebot
 from datetime import datetime
 from dotenv import load_dotenv
 
-# Logging setup
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-
+# सेटअप
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 load_dotenv()
-
-# Configuration
-API_KEY = os.getenv('API_KEY')
-API_SECRET = os.getenv('API_SECRET')
-BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
+bot = telebot.TeleBot(os.getenv('TELEGRAM_BOT_TOKEN'))
 CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
-
-telegram_bot = telebot.TeleBot(BOT_TOKEN) if BOT_TOKEN else None
-
-# Path for server stability (Railway/Render)
-STATE_FILE = '/tmp/trade_state.json' 
-
-def send_telegram(message):
-    if telegram_bot and CHAT_ID:
-        try:
-            telegram_bot.send_message(CHAT_ID, message)
-        except Exception as e:
-            logging.error(f"Telegram error: {e}")
 
 class PrimeScalpBot:
     def __init__(self):
-        self.exchange = ccxt.delta({
-            'apiKey': API_KEY, 'secret': API_SECRET,
-            'enableRateLimit': True,
-            'options': {'defaultType': 'future', 'adjustForTimeDifference': True}
-        })
+        self.exchange = ccxt.delta({'apiKey': os.getenv('API_KEY'), 'secret': os.getenv('API_SECRET'), 'enableRateLimit': True, 'options': {'defaultType': 'future'}})
         self.symbols = ['BTC/USDT:USDT', 'ETH/USDT:USDT']
-        self.DAILY_LOSS_LIMIT = -600
-        self.daily_pnl = 0
-        self.today_date = datetime.now().date()
-        self.active_trades = {}
-        self.pending_entry = {}
-        self.last_alert_time = {}
-        self.load_trade_state()
-        send_telegram("🚀 Prime Scalp - Digital Guardian Active")
+        self.state = {'trades': {}}
+        self.load_state()
 
-    def load_trade_state(self):
-        if os.path.exists(STATE_FILE):
-            with open(STATE_FILE, 'r') as f:
-                data = json.load(f)
-                self.active_trades = data.get('trades', {})
-                self.daily_pnl = data.get('daily_pnl', 0)
+    def send_telegram(self, msg):
+        try: bot.send_message(CHAT_ID, msg)
+        except: pass
 
-    def save_trade_state(self):
-        with open(STATE_FILE, 'w') as f:
-            json.dump({'trades': self.active_trades, 'daily_pnl': self.daily_pnl, 'date': str(self.today_date)}, f)
+    def load_state(self):
+        if os.path.exists('trade_state.json'):
+            with open('trade_state.json', 'r') as f: self.state = json.load(f)
 
-    def fetch_indicators(self, symbol, timeframe='5m', limit=100):
-        try:
-            bars = self.exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-            df = pd.DataFrame(bars, columns=['ts', 'open', 'high', 'low', 'close', 'vol'])
-            df['tema'] = df['close'].ewm(span=9, adjust=False).mean()
-            return df
-        except: return None
+    def save_state(self):
+        with open('trade_state.json', 'w') as f: json.dump(self.state, f, indent=4)
 
-    def alert_system_1m(self, symbol):
-        """नया: 1-मिनट अलर्ट सिस्टम"""
-        df = self.fetch_indicators(symbol, '1m', limit=10)
-        if df is not None and len(df) > 0:
-            if df['close'].iloc[-1] > df['tema'].iloc[-1]: return "1m_BULLISH"
-            if df['close'].iloc[-1] < df['tema'].iloc[-1]: return "1m_BEARISH"
-        return None
+    def fetch_indicators(self, symbol):
+        bars = self.exchange.fetch_ohlcv(symbol, timeframe='5m', limit=100)
+        df = pd.DataFrame(bars, columns=['ts', 'open', 'high', 'low', 'close', 'vol'])
+        df['tema'] = ta.tema(df['close'], length=9)
+        df['vwap'] = ta.vwap(df['high'], df['low'], df['close'], df['vol'])
+        st = ta.supertrend(df['high'], df['low'], df['close'], length=10, multiplier=3)
+        df['st'] = st['SUPERT_10_3.0']
+        df['rsi'] = ta.rsi(df['close'], length=14)
+        df['adx'] = ta.adx(df['high'], df['low'], df['close'], length=14)['ADX_14']
+        df['cmf'] = ta.cmf(df['high'], df['low'], df['close'], df['vol'], length=20)
+        df['atr'] = ta.atr(df['high'], df['low'], df['close'], length=14)
+        return df
+
+    def is_news_spike(self, symbol):
+        df = self.fetch_indicators(symbol)
+        return df['atr'].iloc[-1] > (df['atr'].iloc[-10:-1].mean() * 2.0)
+
+    def check_filters(self, df):
+        last = df.iloc[-1]
+        long = (last['close'] > last['tema']) and (last['close'] > last['vwap']) and (last['st'] < last['close']) and (last['rsi'] > 50) and (last['adx'] > 20) and (last['cmf'] > 0.05)
+        short = (last['close'] < last['tema']) and (last['close'] < last['vwap']) and (last['st'] > last['close']) and (last['rsi'] < 50) and (last['adx'] > 20) and (last['cmf'] < -0.05)
+        return 'long' if long else 'short' if short else None
+
+    def manage_trade(self, symbol, trade, df):
+        curr = df['close'].iloc[-1]
+        atr = df['atr'].iloc[-1]
+        entry = trade['entry_price']
+        
+        # 1. टाइम एग्जिट (29 मिनट) -> 25% बाकी बुकिंग
+        if (datetime.now() - datetime.fromisoformat(trade['entry_time'])).total_seconds() > 1740:
+            self.execute_exit(symbol, "Time Exit (29m - Final 25%)")
+            return
+
+        # 2. पहली 25% बुकिंग (ATR * 1.5) -> SL Breakeven
+        if trade['stage'] == 0:
+            tp1 = (entry + (atr * 1.5)) if trade['side'] == 'long' else (entry - (atr * 1.5))
+            if (trade['side'] == 'long' and curr >= tp1) or (trade['side'] == 'short' and curr <= tp1):
+                self.partial_order(symbol, 0.25)
+                trade['stage'] = 1
+                trade['sl_price'] = entry
+                self.send_telegram(f"✅ {symbol} 25% Booked. SL Breakeven set at {entry}")
+                self.save_state()
+
+        # 3. दूसरी 50% बुकिंग (ATR * 2.5) -> SL Trail (ATR * 2.0)
+        elif trade['stage'] == 1:
+            tp2 = (entry + (atr * 2.5)) if trade['side'] == 'long' else (entry - (atr * 2.5))
+            if (trade['side'] == 'long' and curr >= tp2) or (trade['side'] == 'short' and curr <= tp2):
+                self.partial_order(symbol, 0.50)
+                trade['stage'] = 2
+                trade['sl_price'] = (entry + (atr * 2.0)) if trade['side'] == 'long' else (entry - (atr * 2.0))
+                self.send_telegram(f"🚀 {symbol} 50% Booked. SL Trailing at {trade['sl_price']}")
+                self.save_state()
+
+    def partial_order(self, symbol, pct):
+        # मार्केट ऑर्डर से बुकिंग
+        trade = self.state['trades'][symbol]
+        qty = round(trade['total_amount'] * pct, 4)
+        side = 'sell' if trade['side'] == 'long' else 'buy'
+        self.exchange.create_market_order(symbol, side, qty)
+        trade['remaining_amount'] -= qty
+
+    def execute_exit(self, symbol, reason):
+        self.send_telegram(f"🛑 Closing {symbol}: {reason}")
+        trade = self.state['trades'][symbol]
+        side = 'sell' if trade['side'] == 'long' else 'buy'
+        self.exchange.create_market_order(symbol, side, trade['remaining_amount'])
+        del self.state['trades'][symbol]
+        self.save_state()
 
     def run(self):
         while True:
-            try:
-                for symbol in self.symbols:
-                    # 1-मिनट अलर्ट चेक
-                    alert = self.alert_system_1m(symbol)
-                    if alert:
-                        logging.info(f"Alert {symbol}: {alert}")
-                    
-                    # मुख्य ट्रेडिंग लॉजिक यहाँ जारी रखें...
-                    
-                time.sleep(10)
-            except Exception as e:
-                logging.error(f"Loop Error: {e}")
-                time.sleep(60)
+            for symbol in self.symbols:
+                if self.is_news_spike(symbol): continue
+                df = self.fetch_indicators(symbol)
+                
+                if symbol not in self.state['trades']:
+                    signal = self.check_filters(df)
+                    if signal:
+                        price = df['close'].iloc[-1]
+                        lot = 0.01 # अपनी लॉट साइज सेट करें
+                        self.exchange.create_order(symbol, 'limit', 'buy' if signal == 'long' else 'sell', lot, price, {'postOnly': True})
+                        self.state['trades'][symbol] = {'side': signal, 'entry_price': price, 'total_amount': lot, 'remaining_amount': lot, 'stage': 0, 'entry_time': datetime.now().isoformat()}
+                        self.send_telegram(f"⚡ {signal.upper()} Entry {symbol} @ {price}")
+                else:
+                    self.manage_trade(symbol, self.state['trades'][symbol], df)
+            import time; time.sleep(10)
 
 if __name__ == "__main__":
-    bot = PrimeScalpBot()
-    bot.run()
+    PrimeScalpBot().run()
