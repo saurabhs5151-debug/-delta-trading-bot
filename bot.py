@@ -106,9 +106,11 @@ class PrimeScalpBot:
                 return None
             df = pd.DataFrame(bars, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
             
-            # Fix for VWAP and DatetimeIndex warning
+            # --- FIX: Ensure DatetimeIndex is properly converted, sorted, and unique ---
             df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
             df.set_index('timestamp', inplace=True)
+            df = df[~df.index.duplicated(keep='last')]
+            df = df.sort_index()
             
             if PANDAS_TA_AVAILABLE:
                 df['tema'] = ta.tema(df['close'], length=9)
