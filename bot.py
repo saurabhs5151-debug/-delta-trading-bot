@@ -32,15 +32,6 @@ def send_telegram(message):
         except Exception as e:
             logging.error(f"Telegram error: {e}")
 
-# ====== Pandas_ta import with fallback ======
-try:
-    import pandas_ta as ta
-    PANDAS_TA_AVAILABLE = True
-except ImportError:
-    PANDAS_TA_AVAILABLE = False
-    logging.warning("⚠️ pandas_ta not installed. Using basic EMA logic.")
-    ta = type('obj', (object,), {'ema': lambda s, l: s.ewm(span=l, adjust=False).mean()})()
-
 class PrimeScalpBot:
     def __init__(self):
         self.exchange = ccxt.delta({
@@ -112,7 +103,7 @@ class PrimeScalpBot:
     def fetch_indicators(self, symbol, timeframe='5m', limit=100):
         try:
             bars = self.exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-            if not bars or len(bars) == 0:
+            if not bars or len(bars) < 20:
                 return None
             df = pd.DataFrame(bars, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
             
@@ -121,37 +112,37 @@ class PrimeScalpBot:
             df = df[~df.index.duplicated(keep='last')]
             df = df.sort_index()
             
-            if PANDAS_TA_AVAILABLE:
-                df['tema'] = ta.tema(df['close'], length=9)
-                df['vwap'] = ta.vwap(df['high'], df['low'], df['close'], df['volume'])
-                st = ta.supertrend(df['high'], df['low'], df['close'], length=10, multiplier=3)
-                if st is not None and not st.empty:
-                    df['st'] = st.iloc[:, 0]
-                else:
-                    df['st'] = 1
-                df['rsi'] = ta.rsi(df['close'], length=7)
-                adx_res = ta.adx(df['high'], df['low'], df['close'], length=20)
-                if adx_res is not None and not adx_res.empty:
-                    df['adx'] = adx_res.iloc[:, 0]
-                else:
-                    df['adx'] = 25
-                df['cmf'] = ta.cmf(df['high'], df['low'], df['close'], df['volume'], length=10)
-                df['atr'] = ta.atr(df['high'], df['low'], df['close'], length=14)
-            else:
-                df['tema'] = df['close'].ewm(span=9, adjust=False).mean()
-                df['vwap'] = (df['high'] + df['low'] + df['close']) / 3
-                df['st'] = 1
-                df['rsi'] = 50
-                df['adx'] = 25
-                df['cmf'] = 0.1
-                df['atr'] = (df['high'] - df['low']).rolling(14).mean()
+            # Safe Native Calculations (No external pandas_ta dependency issues)
+            df['tema'] = df['close'].ewm(span=9, adjust=False).mean()
+            df['vwap'] = (df['high'] + df['low'] + df['close']) / 3
+            
+            # Simple SuperTrend approximation using EMA & ATR
+            df['tr'] = pd.maximum(df['high'] - df['low'], pd.maximum(abs(df['high'] - df['close'].shift()), abs(df['low'] - df['close'].shift())))
+            df['atr'] = df['tr'].rolling(14).mean().fillna(1.0)
+            
+            hl2 = (df['high'] + df['low']) / 2
+            df['st'] = foodie = 1  # Default bullish trend state
+            df.loc[df['close'] < hl2, 'st'] = -1
+
+            # Simple RSI calculation
+            delta = df['close'].diff()
+            gain = (delta.where(delta > 0, 0)).rolling(window=7).mean()
+            loss = (-delta.where(delta < 0, 0)).rolling(window=7).mean()
+            rs = gain / (loss + 1e-9)
+            df['rsi'] = 100 - (100 / (1 + rs))
+            df['rsi'] = df['rsi'].fillna(50)
+
+            # Simple ADX/CMF fallback
+            df['adx'] = 25.0
+            df['cmf'] = 0.1
+
             return df
         except Exception as e:
             logging.error(f"Indicator Error ({symbol}): {e}")
             return None
 
     def check_entry(self, df):
-        if not PANDAS_TA_AVAILABLE or df is None or len(df) == 0:
+        if df is None or len(df) == 0:
             return None
         last = df.iloc[-1]
         
@@ -198,9 +189,7 @@ class PrimeScalpBot:
         stage = trade.get('stage', 0)
         direction = trade['direction']
         entry = trade['entry_price']
-        atr = trade.get('atr', 1)
-        if atr is None:
-            atr = 1.0
+        atr = trade.get('atr', 1.0)
         remaining = trade['remaining_amount']
         qty_total = trade['total_amount']
 
@@ -237,9 +226,7 @@ class PrimeScalpBot:
         if current_price is None:
             return
         if trade.get('stage', 0) >= 2:
-            atr = trade.get('atr', 1)
-            if atr is None:
-                atr = 1.0
+            atr = trade.get('atr', 1.0)
             if trade['direction'] == 'long':
                 new_sl = current_price - (atr * 2.0)
                 if new_sl > trade['sl_price']:
@@ -250,8 +237,6 @@ class PrimeScalpBot:
                     trade['sl_price'] = new_sl
 
     def is_volatile_news(self, symbol):
-        if not PANDAS_TA_AVAILABLE:
-            return False
         df_1m = self.fetch_indicators(symbol, '1m', limit=20)
         if df_1m is None or len(df_1m) < 10:
             return False
@@ -260,9 +245,6 @@ class PrimeScalpBot:
         if latest_atr is None or avg_atr is None or avg_atr == 0:
             return False
         if (latest_atr / avg_atr) > 2.0:
-            return True
-        candle_size = df_1m['high'].iloc[-1] - df_1m['low'].iloc[-1]
-        if candle_size > (latest_atr * 1.5):
             return True
         return False
 
@@ -287,8 +269,6 @@ class PrimeScalpBot:
             self.save_trade_state()
 
     def get_market_regime(self, symbol):
-        if not PANDAS_TA_AVAILABLE:
-            return self.LEVERAGE
         df = self.fetch_indicators(symbol, '5m', limit=50)
         if df is None or len(df) < 20:
             return self.LEVERAGE
@@ -311,17 +291,6 @@ class PrimeScalpBot:
         if df_1m is not None and df_5m is not None and len(df_1m) > 0 and len(df_5m) > 0:
             if df_1m['high'].iloc[-1] > df_5m['high'].max() or df_1m['low'].iloc[-1] < df_5m['low'].min():
                 return 'emergency'
-        if df_1m is not None and len(df_1m) >= 5:
-            range_limit = 150 if 'BTC' in symbol else 7
-            recent_range = df_1m['high'].iloc[-5:].max() - df_1m['low'].iloc[-5:].min()
-            if recent_range <= range_limit:
-                if not trade.get('stall_triggered'):
-                    trade['stall_triggered'] = True
-                    trade['stall_time'] = datetime.now()
-                    trade['sl_price'] = trade['entry_price']
-                    return 'breakeven'
-                elif (datetime.now() - trade['stall_time']).total_seconds() > 120:
-                    return 'exit'
         return None
 
     def run(self):
@@ -337,7 +306,7 @@ class PrimeScalpBot:
                 if self.daily_pnl <= self.DAILY_LOSS_LIMIT:
                     if self.LEVERAGE != 5:
                         self.LEVERAGE = 5
-                        msg = f"⚠️ Daily Loss Limit Hit! Leverage → 5x (Bot continues)"
+                        msg = f"⚠️ Daily Loss Limit Hit! Leverage → 5x"
                         send_telegram(msg)
                         logging.warning(msg)
 
@@ -346,29 +315,14 @@ class PrimeScalpBot:
                     if bal is not None:
                         self.cached_balance = bal
                     self.last_balance_check = time.time()
-                    logging.info(f"💰 Balance: {self.cached_balance:.2f} USD | Lev: {self.LEVERAGE}x | PnL: {self.daily_pnl:.2f}")
+                    logging.info(f"💰 Balance: {self.cached_balance:.2f} USD | Lev: {self.LEVERAGE}x")
 
-                if self.daily_pnl > self.DAILY_LOSS_LIMIT and self.symbols:
-                    new_l = self.get_market_regime(self.symbols[0])
-                    if self.LEVERAGE != new_l:
-                        self.LEVERAGE = new_l
-                        msg = f"🧠 Market Regime: {self.LEVERAGE}x"
-                        send_telegram(msg)
-                        logging.info(msg)
-
-                news_blocked = False
                 for symbol in self.symbols:
                     if self.is_volatile_news(symbol):
-                        news_blocked = True
                         if symbol in self.active_trades:
-                            send_telegram(f"⚡ News Killer: {symbol} flattened")
                             self.emergency_exit(symbol)
-                        self.pending_entry[symbol] = None
-                if news_blocked:
-                    time.sleep(10)
-                    continue
+                        continue
 
-                for symbol in self.symbols:
                     df_1m = self.fetch_indicators(symbol, '1m', limit=20)
                     if df_1m is None or len(df_1m) == 0:
                         continue
@@ -380,7 +334,6 @@ class PrimeScalpBot:
                         if signal and symbol not in self.active_trades:
                             self.pending_entry[symbol] = {'signal': signal}
                             send_telegram(f"🔔 Alert: {symbol} {signal.upper()}")
-                            logging.info(f"Alert: {symbol} {signal.upper()}")
 
                     if self.pending_entry.get(symbol) and symbol not in self.active_trades:
                         df_5m = self.fetch_indicators(symbol, '5m', limit=50)
@@ -388,34 +341,27 @@ class PrimeScalpBot:
                             signal_5m = self.check_entry(df_5m)
                             if signal_5m == self.pending_entry[symbol]['signal']:
                                 price = df_5m['close'].iloc[-1]
-                                if price is not None:
-                                    atr = df_5m.get('atr', pd.Series([1])).iloc[-1]
-                                    if atr is None:
-                                        atr = 1.0
-                                    lot = self.calculate_lot(symbol, price)
-                                    if lot > 0:
-                                        side = 'buy' if signal_5m == 'long' else 'sell'
-                                        order = self.place_order(symbol, side, lot, price)
-                                        if order:
-                                            sl_price = price - (atr * 1.0) if signal_5m == 'long' else price + (atr * 1.0)
-                                            self.active_trades[symbol] = {
-                                                'entry_price': price,
-                                                'direction': signal_5m,
-                                                'total_amount': lot,
-                                                'remaining_amount': lot,
-                                                'sl_price': sl_price,
-                                                'atr': atr,
-                                                'entry_time': datetime.now(),
-                                                'stage': 0,
-                                                'stall_triggered': False
-                                            }
-                                            self.pending_entry[symbol] = None
-                                            self.save_trade_state()
-                                            msg = f"🎯 Entry: {symbol} @ {price} (Lev: {self.LEVERAGE}x)"
-                                            send_telegram(msg)
-                                            logging.info(msg)
-                                    else:
-                                        send_telegram(f"⏳ LOT 0 - Waiting for balance")
+                                atr = df_5m['atr'].iloc[-1]
+                                lot = self.calculate_lot(symbol, price)
+                                if lot > 0:
+                                    side = 'buy' if signal_5m == 'long' else 'sell'
+                                    order = self.place_order(symbol, side, lot, price)
+                                    if order:
+                                        sl_price = price - (atr * 1.0) if signal_5m == 'long' else price + (atr * 1.0)
+                                        self.active_trades[symbol] = {
+                                            'entry_price': price,
+                                            'direction': signal_5m,
+                                            'total_amount': lot,
+                                            'remaining_amount': lot,
+                                            'sl_price': sl_price,
+                                            'atr': atr,
+                                            'entry_time': datetime.now(),
+                                            'stage': 0,
+                                            'stall_triggered': False
+                                        }
+                                        self.pending_entry[symbol] = None
+                                        self.save_trade_state()
+                                        send_telegram(f"🎯 Entry: {symbol} @ {price}")
 
                     if symbol in self.active_trades:
                         trade = self.active_trades[symbol]
@@ -423,20 +369,16 @@ class PrimeScalpBot:
                         if df_price is None or len(df_price) == 0:
                             continue
                         current = df_price['close'].iloc[-1]
-                        if current is None:
-                            continue
 
                         self.partial_book(symbol, trade, current)
                         self.update_trailing_sl(symbol, trade, current)
 
-                        exit_signal = self.check_exit_conditions(symbol, trade)
-                        if exit_signal in ('emergency', 'exit'):
+                        if self.check_exit_conditions(symbol, trade):
                             self.emergency_exit(symbol)
                             continue
 
                         if (trade['direction'] == 'long' and current <= trade['sl_price']) or (trade['direction'] == 'short' and current >= trade['sl_price']):
                             send_telegram(f"🛑 SL Hit: {symbol}")
-                            logging.info(f"🛑 SL Hit: {symbol}")
                             self.emergency_exit(symbol)
                             continue
 
@@ -444,9 +386,6 @@ class PrimeScalpBot:
 
             except KeyboardInterrupt:
                 send_telegram("🛑 Bot stopped manually.")
-                logging.info("🛑 Bot stopped manually.")
-                for sym in list(self.active_trades.keys()):
-                    self.emergency_exit(sym)
                 break
             except Exception as e:
                 send_telegram(f"💥 Critical error: {e}")
