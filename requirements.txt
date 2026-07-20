@@ -1,6 +1,3 @@
-# Prime Scalp Bot Requirements
-pandas>=2.0.0          # डेटा एनालिसिस और फिल्टर के लिए
-numpy>=1.24.0          # गणितीय गणनाओं के लिए
-requests>=2.31.0       # API कॉल्स के लिए
-ccxt>=4.0.0            # क्रिप्टो एक्सचेंज कनेक्टिविटी के लिए
-python-dotenv>=1.0.0   # API कीज़ सुरक्षित रखने के लिए
+ccxt
+python-dotenv
+pandas
