@@ -60,11 +60,13 @@ class PrimeScalpBot:
         self.active_trades = {}
         self.pending_entry = {}
         self.last_alert_time = {}
-        self.cached_balance = 1000
+        self.cached_balance = 1000.0
         self.last_balance_check = 0
         self.load_trade_state()
         
-        self.cached_balance = self.get_balance()
+        bal = self.get_balance()
+        if bal is not None:
+            self.cached_balance = bal
         self.last_balance_check = time.time()
         
         send_telegram("🚀 Prime Scalp - Digital Guardian Active")
@@ -91,12 +93,20 @@ class PrimeScalpBot:
     def get_balance(self):
         try:
             bal = self.exchange.fetch_balance()
-            return bal['total'].get('USD', bal['total'].get('USDT', 1000))
-        except:
-            return 1000
+            total = bal.get('total', {})
+            val = total.get('USD', total.get('USDT', None))
+            if val is not None:
+                return float(val)
+            return 1000.0
+        except Exception as e:
+            logging.error(f"Balance fetch error: {e}")
+            return self.cached_balance if self.cached_balance else 1000.0
 
     def calculate_lot(self, symbol, price):
-        raw = (self.cached_balance * 0.25 * self.LEVERAGE) / price
+        if price is None or price <= 0:
+            return 0.0
+        bal = self.cached_balance if self.cached_balance else 1000.0
+        raw = (bal * 0.25 * self.LEVERAGE) / price
         return round(raw, 4) if 'BTC' in symbol else round(raw, 2)
 
     def fetch_indicators(self, symbol, timeframe='5m', limit=100):
@@ -145,7 +155,6 @@ class PrimeScalpBot:
             return None
         last = df.iloc[-1]
         
-        # Safe extraction with None protection
         close = last.get('close')
         tema = last.get('tema')
         vwap = last.get('vwap')
@@ -162,7 +171,7 @@ class PrimeScalpBot:
         return 'long' if long_cond else 'short' if short_cond else None
 
     def place_order(self, symbol, side, amount, price):
-        if amount <= 0:
+        if amount is None or amount <= 0:
             send_telegram(f"⚠️ LOT 0 - Balance low, skip ({symbol})")
             logging.warning(f"LOT 0 - Skip: {symbol}")
             return None
@@ -184,10 +193,14 @@ class PrimeScalpBot:
             return None
 
     def partial_book(self, symbol, trade, current_price):
+        if current_price is None:
+            return
         stage = trade.get('stage', 0)
         direction = trade['direction']
         entry = trade['entry_price']
         atr = trade.get('atr', 1)
+        if atr is None:
+            atr = 1.0
         remaining = trade['remaining_amount']
         qty_total = trade['total_amount']
 
@@ -221,8 +234,12 @@ class PrimeScalpBot:
                         logging.error(f"Book error: {e}")
 
     def update_trailing_sl(self, symbol, trade, current_price):
+        if current_price is None:
+            return
         if trade.get('stage', 0) >= 2:
             atr = trade.get('atr', 1)
+            if atr is None:
+                atr = 1.0
             if trade['direction'] == 'long':
                 new_sl = current_price - (atr * 2.0)
                 if new_sl > trade['sl_price']:
@@ -240,7 +257,9 @@ class PrimeScalpBot:
             return False
         latest_atr = df_1m['atr'].iloc[-1]
         avg_atr = df_1m['atr'].iloc[-10:-1].mean()
-        if avg_atr > 0 and (latest_atr / avg_atr) > 2.0:
+        if latest_atr is None or avg_atr is None or avg_atr == 0:
+            return False
+        if (latest_atr / avg_atr) > 2.0:
             return True
         candle_size = df_1m['high'].iloc[-1] - df_1m['low'].iloc[-1]
         if candle_size > (latest_atr * 1.5):
@@ -254,10 +273,11 @@ class PrimeScalpBot:
                 df = self.fetch_indicators(symbol, '1m', limit=1)
                 if df is not None and len(df) > 0:
                     current = df['close'].iloc[-1]
-                    pnl = (current - trade['entry_price']) * trade['remaining_amount'] if trade['direction'] == 'long' else (trade['entry_price'] - current) * trade['remaining_amount']
-                    self.daily_pnl += pnl
-                    send_telegram(f"📊 Exit PnL: {pnl:.2f} | Day PnL: {self.daily_pnl:.2f} USD")
-                    logging.info(f"Exit PnL: {pnl:.2f}")
+                    if current is not None:
+                        pnl = (current - trade['entry_price']) * trade['remaining_amount'] if trade['direction'] == 'long' else (trade['entry_price'] - current) * trade['remaining_amount']
+                        self.daily_pnl += pnl
+                        send_telegram(f"📊 Exit PnL: {pnl:.2f} | Day PnL: {self.daily_pnl:.2f} USD")
+                        logging.info(f"Exit PnL: {pnl:.2f}")
                 side = 'sell' if trade['direction'] == 'long' else 'buy'
                 self.exchange.create_market_order(symbol, side, trade['remaining_amount'])
                 send_telegram(f"🛑 Exit: {symbol}")
@@ -322,7 +342,9 @@ class PrimeScalpBot:
                         logging.warning(msg)
 
                 if time.time() - self.last_balance_check > 300:
-                    self.cached_balance = self.get_balance()
+                    bal = self.get_balance()
+                    if bal is not None:
+                        self.cached_balance = bal
                     self.last_balance_check = time.time()
                     logging.info(f"💰 Balance: {self.cached_balance:.2f} USD | Lev: {self.LEVERAGE}x | PnL: {self.daily_pnl:.2f}")
 
@@ -366,31 +388,34 @@ class PrimeScalpBot:
                             signal_5m = self.check_entry(df_5m)
                             if signal_5m == self.pending_entry[symbol]['signal']:
                                 price = df_5m['close'].iloc[-1]
-                                atr = df_5m.get('atr', pd.Series([1])).iloc[-1] if 'atr' in df_5m else 1
-                                lot = self.calculate_lot(symbol, price)
-                                if lot > 0:
-                                    side = 'buy' if signal_5m == 'long' else 'sell'
-                                    order = self.place_order(symbol, side, lot, price)
-                                    if order:
-                                        sl_price = price - (atr * 1.0) if signal_5m == 'long' else price + (atr * 1.0)
-                                        self.active_trades[symbol] = {
-                                            'entry_price': price,
-                                            'direction': signal_5m,
-                                            'total_amount': lot,
-                                            'remaining_amount': lot,
-                                            'sl_price': sl_price,
-                                            'atr': atr,
-                                            'entry_time': datetime.now(),
-                                            'stage': 0,
-                                            'stall_triggered': False
-                                        }
-                                        self.pending_entry[symbol] = None
-                                        self.save_trade_state()
-                                        msg = f"🎯 Entry: {symbol} @ {price} (Lev: {self.LEVERAGE}x)"
-                                        send_telegram(msg)
-                                        logging.info(msg)
-                                else:
-                                    send_telegram(f"⏳ LOT 0 - Waiting for balance")
+                                if price is not None:
+                                    atr = df_5m.get('atr', pd.Series([1])).iloc[-1]
+                                    if atr is None:
+                                        atr = 1.0
+                                    lot = self.calculate_lot(symbol, price)
+                                    if lot > 0:
+                                        side = 'buy' if signal_5m == 'long' else 'sell'
+                                        order = self.place_order(symbol, side, lot, price)
+                                        if order:
+                                            sl_price = price - (atr * 1.0) if signal_5m == 'long' else price + (atr * 1.0)
+                                            self.active_trades[symbol] = {
+                                                'entry_price': price,
+                                                'direction': signal_5m,
+                                                'total_amount': lot,
+                                                'remaining_amount': lot,
+                                                'sl_price': sl_price,
+                                                'atr': atr,
+                                                'entry_time': datetime.now(),
+                                                'stage': 0,
+                                                'stall_triggered': False
+                                            }
+                                            self.pending_entry[symbol] = None
+                                            self.save_trade_state()
+                                            msg = f"🎯 Entry: {symbol} @ {price} (Lev: {self.LEVERAGE}x)"
+                                            send_telegram(msg)
+                                            logging.info(msg)
+                                    else:
+                                        send_telegram(f"⏳ LOT 0 - Waiting for balance")
 
                     if symbol in self.active_trades:
                         trade = self.active_trades[symbol]
@@ -398,6 +423,8 @@ class PrimeScalpBot:
                         if df_price is None or len(df_price) == 0:
                             continue
                         current = df_price['close'].iloc[-1]
+                        if current is None:
+                            continue
 
                         self.partial_book(symbol, trade, current)
                         self.update_trailing_sl(symbol, trade, current)
