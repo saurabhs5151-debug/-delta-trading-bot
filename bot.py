@@ -49,7 +49,6 @@ class PrimeScalpBot:
             'enableRateLimit': True,
             'options': {'defaultType': 'future', 'adjustForTimeDifference': True}
         })
-        # सही डेल्टा परपेचुअल सिंबल फॉर्मेट अपडेट किया गया है
         self.symbols = ['BTC/USDT:USDT', 'ETH/USDT:USDT']
         self.BASE_LEVERAGE = 25
         self.MID_LEVERAGE = 15
@@ -104,6 +103,10 @@ class PrimeScalpBot:
         try:
             bars = self.exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
             df = pd.DataFrame(bars, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            
+            # Fix for VWAP and DatetimeIndex warning
+            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+            df.set_index('timestamp', inplace=True)
             
             if PANDAS_TA_AVAILABLE:
                 df['tema'] = ta.tema(df['close'], length=9)
@@ -322,7 +325,9 @@ class PrimeScalpBot:
                     df_1m = self.fetch_indicators(symbol, '1m', limit=20)
                     if df_1m is None:
                         continue
-                    last_ts = df_1m['timestamp'].iloc[-1]
+                    
+                    # Since index is now datetime, get the last timestamp safely
+                    last_ts = str(df_1m.index[-1])
                     if self.last_alert_time.get(symbol) != last_ts:
                         self.last_alert_time[symbol] = last_ts
                         signal = self.check_entry(df_1m)
@@ -337,7 +342,7 @@ class PrimeScalpBot:
                             signal_5m = self.check_entry(df_5m)
                             if signal_5m == self.pending_entry[symbol]['signal']:
                                 price = df_5m['close'].iloc[-1]
-                                atr = df_5m.get('atr', [1]).iloc[-1] if 'atr' in df_5m else 1
+                                atr = df_5m.get('atr', pd.Series([1])).iloc[-1] if 'atr' in df_5m else 1
                                 lot = self.calculate_lot(symbol, price)
                                 if lot > 0:
                                     side = 'buy' if signal_5m == 'long' else 'sell'
