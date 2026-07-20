@@ -102,11 +102,10 @@ class PrimeScalpBot:
     def fetch_indicators(self, symbol, timeframe='5m', limit=100):
         try:
             bars = self.exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-            if not bars:
+            if not bars or len(bars) == 0:
                 return None
             df = pd.DataFrame(bars, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
             
-            # --- FIX: Ensure DatetimeIndex is properly converted, sorted, and unique ---
             df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
             df.set_index('timestamp', inplace=True)
             df = df[~df.index.duplicated(keep='last')]
@@ -116,9 +115,16 @@ class PrimeScalpBot:
                 df['tema'] = ta.tema(df['close'], length=9)
                 df['vwap'] = ta.vwap(df['high'], df['low'], df['close'], df['volume'])
                 st = ta.supertrend(df['high'], df['low'], df['close'], length=10, multiplier=3)
-                df['st'] = st.iloc[:, 0]
+                if st is not None and not st.empty:
+                    df['st'] = st.iloc[:, 0]
+                else:
+                    df['st'] = 1
                 df['rsi'] = ta.rsi(df['close'], length=7)
-                df['adx'] = ta.adx(df['high'], df['low'], df['close'], length=20).iloc[:, 0]
+                adx_res = ta.adx(df['high'], df['low'], df['close'], length=20)
+                if adx_res is not None and not adx_res.empty:
+                    df['adx'] = adx_res.iloc[:, 0]
+                else:
+                    df['adx'] = 25
                 df['cmf'] = ta.cmf(df['high'], df['low'], df['close'], df['volume'], length=10)
                 df['atr'] = ta.atr(df['high'], df['low'], df['close'], length=14)
             else:
