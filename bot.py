@@ -1,10 +1,10 @@
-import ccxt
-import pandas as pd
 import os
 import time
 import json
 import logging
 import telebot
+import ccxt
+import pandas as pd
 from datetime import datetime
 from dotenv import load_dotenv
 
@@ -44,6 +44,12 @@ class PrimeScalpBot:
         self.cached_balance = 1000.0
         self.last_balance_check = 0
         self.load_trade_state()
+        
+        try:
+            self.exchange.load_markets() # एक्सचेंज के रूल्स लोड करना जरूरी है
+        except Exception as e:
+            logging.error(f"Failed to load markets: {e}")
+            
         self.cached_balance = self.get_balance()
         self.last_balance_check = time.time()
         send_telegram("🚀 Prime Scalp - Digital Guardian Active")
@@ -78,8 +84,19 @@ class PrimeScalpBot:
     def calculate_lot(self, symbol, price):
         if price is None or price <= 0:
             return 0.0
-        raw = (self.cached_balance * 0.25 * self.LEVERAGE) / price
-        return round(raw, 4) if 'BTC' in symbol else round(raw, 2)
+        try:
+            # $1 मार्जिन या आपके बैलेंस के हिसाब से कैलकुलेशन
+            raw = (self.cached_balance * 0.25 * self.LEVERAGE) / price
+            
+            # एक्सचेंज की मिनिमम लिमिट और प्रेसिजन का मिलान
+            market = self.exchange.market(symbol)
+            min_qty = market['limits']['amount']['min']
+            final_qty = max(raw, min_qty)
+            
+            return float(self.exchange.amount_to_precision(symbol, final_qty))
+        except Exception as e:
+            logging.error(f"Lot calculation error for {symbol}: {e}")
+            return 0.0
 
     def fetch_indicators(self, symbol, timeframe='5m', limit=100):
         try:
@@ -105,8 +122,22 @@ class PrimeScalpBot:
             rs = gain / (loss + 1e-9)
             df['rsi'] = 100 - (100 / (1 + rs))
             df['rsi'] = df['rsi'].fillna(50)
-            df['adx'] = 25.0
-            df['cmf'] = 0.1
+            
+            # असली ADX और CMF कैलकुलेशन (हार्डकोडेड वैल्यू हटाई गई)
+            high, low, close, vol = df['high'], df['low'], df['close'], df['volume']
+            plus_dm = high.diff(); minus_dm = low.diff()
+            plus_dm = pd.Series([i if (i > j and i > 0) else 0 for i, j in zip(plus_dm, minus_dm)], index=df.index)
+            minus_dm = pd.Series([j if (j > i and j > 0) else 0 for i, j in zip(plus_dm, minus_dm)], index=df.index)
+            tr14 = df['atr'] * 14
+            plus_di = 100 * (plus_dm.rolling(14).mean() / (tr14 + 1e-9))
+            minus_di = 100 * (minus_dm.rolling(14).mean() / (tr14 + 1e-9))
+            dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di + 1e-9)
+            df['adx'] = dx.rolling(14).mean().fillna(25.0)
+            
+            mfm = ((close - low) - (high - close)) / (high - low + 1e-9)
+            mfv = mfm * vol
+            df['cmf'] = (mfv.rolling(20).sum() / (vol.rolling(20).sum() + 1e-9)).fillna(0.1)
+            
             return df
         except Exception as e:
             logging.error(f"Indicator Error ({symbol}): {e}")
@@ -116,14 +147,11 @@ class PrimeScalpBot:
         if df is None or len(df) == 0:
             return None
         last = df.iloc[-1]
-        close = last.get('close')
-        tema = last.get('tema')
-        vwap = last.get('vwap')
-        ema_200 = last.get('ema_200')
-        st = last.get('st', 1)
-        rsi = last.get('rsi')
-        adx = last.get('adx')
-        cmf = last.get('cmf')
+        close, tema, vwap, ema_200, st, rsi, adx, cmf = (
+            last.get('close'), last.get('tema'), last.get('vwap'), 
+            last.get('ema_200'), last.get('st', 1), last.get('rsi'), 
+            last.get('adx'), last.get('cmf')
+        )
         if any(v is None for v in [close, tema, vwap, ema_200, rsi, adx, cmf]):
             return None
         long_cond = (close > tema and close > vwap and close > ema_200 and st == 1 and rsi > 50 and adx > 20 and cmf > 0.05)
@@ -135,17 +163,22 @@ class PrimeScalpBot:
             send_telegram(f"⚠️ LOT 0 - Balance low, skip ({symbol})")
             return None
         try:
-            order = self.exchange.create_limit_order(symbol, side, amount, price, params={'postOnly': True})
+            # प्राइस और अमाउंट दोनों को एक्सचेंज के प्रेसिजन नियमों के अनुसार फॉर्मेट करें
+            formatted_price = float(self.exchange.price_to_precision(symbol, price))
+            formatted_amount = float(self.exchange.amount_to_precision(symbol, amount))
+            
+            order = self.exchange.create_limit_order(symbol, side, formatted_amount, formatted_price, params={'postOnly': True})
             time.sleep(5)
             status = self.exchange.fetch_order(order['id'], symbol)
             if status['status'] == 'open':
                 self.exchange.cancel_order(order['id'], symbol)
                 send_telegram(f"⚠️ Limit order not filled, cancelled: {symbol}")
                 return None
-            send_telegram(f"✅ {side.upper()} {symbol} {amount} @ {price} (Leverage: {self.LEVERAGE}x)")
+            send_telegram(f"✅ {side.upper()} {symbol} {formatted_amount} @ {formatted_price} (Leverage: {self.LEVERAGE}x)")
             return order
         except Exception as e:
             send_telegram(f"❌ Order failed: {e}")
+            logging.error(f"Order failed for {symbol}: {e}")
             return None
 
     def partial_book(self, symbol, trade, current_price):
@@ -160,7 +193,7 @@ class PrimeScalpBot:
         if stage == 0:
             tp1 = entry + (atr * 1.5) if direction == 'long' else entry - (atr * 1.5)
             if (direction == 'long' and current_price >= tp1) or (direction == 'short' and current_price <= tp1):
-                qty = round(qty_total * 0.25, 4 if 'BTC' in symbol else 2)
+                qty = float(self.exchange.amount_to_precision(symbol, qty_total * 0.25))
                 if qty > 0 and qty <= remaining:
                     try:
                         self.exchange.create_market_order(symbol, 'sell' if direction == 'long' else 'buy', qty)
@@ -173,7 +206,7 @@ class PrimeScalpBot:
         elif stage == 1:
             tp2 = entry + (atr * 2.5) if direction == 'long' else entry - (atr * 2.5)
             if (direction == 'long' and current_price >= tp2) or (direction == 'short' and current_price <= tp2):
-                qty = round(qty_total * 0.50, 4 if 'BTC' in symbol else 2)
+                qty = float(self.exchange.amount_to_precision(symbol, qty_total * 0.50))
                 if qty > 0 and qty <= remaining:
                     try:
                         self.exchange.create_market_order(symbol, 'sell' if direction == 'long' else 'buy', qty)
@@ -226,32 +259,15 @@ class PrimeScalpBot:
             del self.active_trades[symbol]
             self.save_trade_state()
 
-    def get_market_regime(self, symbol):
-        df = self.fetch_indicators(symbol, '5m', limit=50)
-        if df is None or len(df) < 20:
-            return self.LEVERAGE
-        latest_adx = df['adx'].iloc[-1]
-        if latest_adx is None:
-            return self.LEVERAGE
-        if latest_adx > 25:
-            return 25
-        elif latest_adx < 20:
-            return 5
-        return 15
-
     def check_exit_conditions(self, symbol, trade):
         elapsed = (datetime.now() - trade['entry_time']).total_seconds() / 60
         if elapsed >= 29:
             return 'exit'
-        df_1m = self.fetch_indicators(symbol, '1m', limit=10)
-        df_5m = self.fetch_indicators(symbol, '5m', limit=5)
-        if df_1m is not None and df_5m is not None and len(df_1m) > 0 and len(df_5m) > 0:
-            if df_1m['high'].iloc[-1] > df_5m['high'].max() or df_1m['low'].iloc[-1] < df_5m['low'].min():
-                return 'emergency'
         return None
 
     def run(self):
         last_alert_seconds = 0
+        send_telegram("🟢 Bot Loop Started Successfully.")
         while True:
             try:
                 if datetime.now().date() != self.today_date:
