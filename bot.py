@@ -6,9 +6,13 @@ import pandas_ta as ta
 import ccxt
 import requests
 import os
+from dotenv import load_dotenv
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "YOUR_CHAT_ID")
+# .dotenv फाइल से सेंसिटिव डेटा लोड करने के लिए
+load_dotenv()
+
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 def send_telegram(message):
     try:
@@ -34,10 +38,10 @@ class TradingBot:
         self.last_alert_time = {}
         self.last_alert_seconds = {}
         
-        # CCXT एक्सचेंज सेटअप
+        # CCXT एक्सचेंज सेटअप - .env फाइल के असली और सटीक नाम
         self.exchange = ccxt.delta({
-            'apiKey': os.getenv("API_KEY", "YOUR_API_KEY"),
-            'secret': os.getenv("SECRET_KEY", "YOUR_SECRET_KEY"),
+            'apiKey': os.getenv("DELTA_API_KEY"),
+            'secret': os.getenv("DELTA_API_SECRET"),
             'enableRateLimit': True,
             'options': {'defaultType': 'swap'}
         })
@@ -79,7 +83,7 @@ class TradingBot:
                     if current_adx >= 25:
                         self.LEVERAGE = 50  # ADX 25 के ऊपर → 50x लेवरेज
                     elif current_adx >= 22:
-                        self.LEVERAGE = 20  # ADX 22 के ऊपर → 10x से 20x लेवरेज (यहाँ 20x सेट किया है)
+                        self.LEVERAGE = 20  # ADX 22 के ऊपर → 20x लेवरेज
                     else:
                         self.LEVERAGE = 5   # ADX 20 के अंदर/नीचे → 5x लेवरेज
 
@@ -101,7 +105,7 @@ class TradingBot:
                             self.pending_entry[symbol] = {'signal': signal, 'score': score}
                             send_telegram(f"🔔 *Smart Alert*: {symbol} Signal -> *{signal.upper()}* (Score: {score}/6) | Lev: {self.LEVERAGE}x")
 
-                    # 5m कन्फर्मेशन के बाद रियल ट्रेड लेना (स्मार्ट स्कोरिंग के साथ ताकि ट्रेड मिस न हो)
+                    # 5m कन्फर्मेशन के बाद रियल ट्रेड लेना (स्मार्ट स्कोरिंग के साथ)
                     if self.pending_entry.get(symbol) and symbol not in self.active_trades:
                         df_5m = self.fetch_indicators(symbol, '5m', limit=100)
                         if df_5m is not None and len(df_5m) > 30:
@@ -249,15 +253,13 @@ class TradingBot:
             logging.error(f"Check Entry Error: {e}")
         return None, 0
 
-    # 💡 सबके लिए एक समान (Universal) लॉट साइज कैलकुलेशन - बैलेंस और लेवरेज के आधार पर
     def calculate_lot(self, symbol, price):
         try:
             balance = self.cached_balance if self.cached_balance > 0 else self.get_balance()
             if balance <= 0:
                 balance = 10  # फॉलबैक बैलेंस
             
-            # उपलब्ध बैलेंस और वर्तमान लेवरेज के अनुपात में ट्रेड साइज
-            notional_amount = balance * self.LEVERAGE * 0.5  # बैलेंस का 50% मार्जिन इस्तेमाल करके पोजीशन
+            notional_amount = balance * self.LEVERAGE * 0.5
             lot = notional_amount / price
             
             min_lot = 0.001 if 'BTC' in symbol else 0.01
