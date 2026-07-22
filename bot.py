@@ -26,7 +26,7 @@ class TradingBot:
         self.today_date = datetime.now().date()
         self.daily_pnl = 0
         self.DAILY_LOSS_LIMIT = -100
-        self.LEVERAGE = 5
+        self.LEVERAGE = 5  # शुरुआती डिफ़ॉल्ट लेवरेज
         self.last_balance_check = 0
         self.cached_balance = 0
         self.active_trades = {}
@@ -34,7 +34,7 @@ class TradingBot:
         self.last_alert_time = {}
         self.last_alert_seconds = {}
         
-        # CCXT एक्सचेंज सेटअप (डेल्टा या बिनेंस जो आप इस्तेमाल कर रहे हैं)
+        # CCXT एक्सचेंज सेटअप
         self.exchange = ccxt.delta({
             'apiKey': os.getenv("API_KEY", "YOUR_API_KEY"),
             'secret': os.getenv("SECRET_KEY", "YOUR_SECRET_KEY"),
@@ -43,7 +43,7 @@ class TradingBot:
         })
 
     def run(self):
-        send_telegram("🟢 Bot Loop Started Successfully (Fully Integrated Filters Mode).")
+        send_telegram("🟢 Bot Loop Started Successfully (Smart Leverage & Heartbeat Mode Active).")
         while True:
             try:
                 if datetime.now().date() != self.today_date:
@@ -62,7 +62,7 @@ class TradingBot:
                     self.last_balance_check = time.time()
 
                 for symbol in self.symbols:
-                    # 5. ATR Spike चेक (News Volatility Filter)
+                    # ATR Spike चेक (News Volatility Filter)
                     if self.is_volatile_news(symbol):
                         if symbol in self.active_trades:
                             self.emergency_exit(symbol)
@@ -73,31 +73,41 @@ class TradingBot:
                         continue
 
                     current_price = df_1m['close'].iloc[-1]
+                    current_adx = df_1m['adx'].iloc[-1]
 
-                    # हर 2 मिनट (120 सेकंड) में रेट अपडेट
+                    # 💡 आपके नियम के अनुसार ADX पर आधारित डायनामिक लेवरेज सेट करना
+                    if current_adx >= 25:
+                        self.LEVERAGE = 30  # मजबूत ट्रेंड में हाई लेवरेज (25x - 50x के बीच)
+                    elif current_adx >= 22:
+                        self.LEVERAGE = 15  # मध्यम ट्रेंड में मीडियम लेवरेज (10x - 20x)
+                    else:
+                        self.LEVERAGE = 5   # कमजोर/साइडवेज मार्केट में सेफ लेवरेज (5x)
+
+                    # हर 2 मिनट (120 सेकंड) में रेट और बॉट एक्टिविटी का अलर्ट (Heartbeat)
                     now_time = time.time()
                     if symbol not in self.last_alert_seconds:
                         self.last_alert_seconds[symbol] = 0
 
                     if now_time - self.last_alert_seconds[symbol] >= 120:
                         self.last_alert_seconds[symbol] = now_time
-                        send_telegram(f"📊 *{symbol} Price Update*: `{current_price:.2f}`")
+                        send_telegram(f"📊 *{symbol} Heartbeat Update*\nPrice: `{current_price:.2f}` | ADX: `{current_adx:.1f}` | Lev: `{self.LEVERAGE}x` | Status: *Running Active*")
 
                     # 1m कैंडल क्लोज पर सिग्नल चेक
                     last_ts = str(df_1m.index[-1])
                     if self.last_alert_time.get(symbol) != last_ts:
                         self.last_alert_time[symbol] = last_ts
-                        signal = self.check_entry(df_1m)
+                        signal, score = self.check_entry(df_1m)
                         if signal and symbol not in self.active_trades:
-                            self.pending_entry[symbol] = {'signal': signal}
-                            send_telegram(f"🔔 *Alert*: {symbol} Signal -> *{signal.upper()}*")
+                            self.pending_entry[symbol] = {'signal': signal, 'score': score}
+                            send_telegram(f"🔔 *Smart Alert*: {symbol} Signal -> *{signal.upper()}* (Score: {score}/6) | Lev: {self.LEVERAGE}x")
 
-                    # 5m कन्फर्मेशन के बाद रियल ट्रेड लेना
+                    # 5m कन्फर्मेशन के बाद रियल ट्रेड लेना (स्मार्ट स्कोरिंग के साथ ताकि ट्रेड मिस न हो)
                     if self.pending_entry.get(symbol) and symbol not in self.active_trades:
                         df_5m = self.fetch_indicators(symbol, '5m', limit=100)
                         if df_5m is not None and len(df_5m) > 30:
-                            signal_5m = self.check_entry(df_5m)
-                            if signal_5m == self.pending_entry[symbol]['signal']:
+                            signal_5m, score_5m = self.check_entry(df_5m)
+                            # यदि स्कोर कम से कम 4 या उससे अधिक है, तो ट्रेड ले लें ताकि मौके हाथ से न छूटें
+                            if signal_5m == self.pending_entry[symbol]['signal'] and score_5m >= 4:
                                 price = df_5m['close'].iloc[-1]
                                 atr = df_5m['atr'].iloc[-1]
                                 lot = self.calculate_lot(symbol, price)
@@ -119,7 +129,7 @@ class TradingBot:
                                         }
                                         self.pending_entry[symbol] = None
                                         self.save_trade_state()
-                                        send_telegram(f"🎯 *Trade Executed ({symbol})*\nSide: *{side.upper()}*\nLot: `{lot}`\nPrice: `{price}`\nSL: `{sl_price:.2f}`")
+                                        send_telegram(f"🎯 *Trade Executed ({symbol})*\nSide: *{side.upper()}*\nLot: `{lot}`\nPrice: `{price}`\nLeverage: `{self.LEVERAGE}x`\nSL: `{sl_price:.2f}`")
 
                 for symbol in list(self.active_trades.keys()):
                     trade = self.active_trades[symbol]
@@ -158,14 +168,12 @@ class TradingBot:
             logging.error(f"Balance Error: {e}")
             return 0
 
-    # 5. is_volatile_news (ATR Spike Check)
     def is_volatile_news(self, symbol):
         try:
             df = self.fetch_indicators(symbol, '1m', limit=20)
             if df is not None and len(df) >= 15:
                 current_atr = df['atr'].iloc[-1]
                 avg_atr = df['atr'][:-1].mean()
-                # अगर करंट ATR एवरेज ATR से ढाई गुना (2.5x) ज्यादा हो जाए तो स्पाइक/न्यूज़ माने
                 if current_atr > (avg_atr * 2.5):
                     send_telegram(f"⚠️ *ATR Spike / News Detected* on {symbol}! Pausing trades.")
                     return True
@@ -173,7 +181,6 @@ class TradingBot:
             logging.error(f"News Check Error: {e}")
         return False
 
-    # 2. fetch_indicators (6 Filters Added: TEMA, VWAP, SuperTrend, RSI, ADX, CMF)
     def fetch_indicators(self, symbol, timeframe, limit):
         try:
             ohlcv = self.exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
@@ -181,33 +188,24 @@ class TradingBot:
             df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
             df.set_index('timestamp', inplace=True)
 
-            # 1. TEMA (Triple Exponential Moving Average)
             df['tema'] = ta.tema(df['close'], length=20)
-
-            # 2. VWAP (Volume Weighted Average Price)
             df['vwap'] = ta.vwap(df['high'], df['low'], df['close'], df['volume'])
 
-            # 3. SuperTrend
             supertrend = ta.supertrend(df['high'], df['low'], df['close'], length=7, multiplier=3)
             if supertrend is not None and not supertrend.empty:
                 df['supertrend'] = supertrend.iloc[:, 0]
             else:
                 df['supertrend'] = df['close']
 
-            # 4. RSI (Relative Strength Index)
             df['rsi'] = ta.rsi(df['close'], length=14)
 
-            # 5. ADX (Average Directional Index)
             adx_df = ta.adx(df['high'], df['low'], df['close'], length=14)
             if adx_df is not None and not adx_df.empty:
                 df['adx'] = adx_df.iloc[:, 0]
             else:
                 df['adx'] = 25
 
-            # 6. CMF (Chaikin Money Flow)
             df['cmf'] = ta.cmf(df['high'], df['low'], df['close'], df['volume'], length=20)
-
-            # ATR (Average True Range)
             df['atr'] = ta.atr(df['high'], df['low'], df['close'], length=14)
 
             return df
@@ -215,7 +213,7 @@ class TradingBot:
             logging.error(f"Error fetching indicators for {symbol}: {e}")
             return None
 
-    # 1. check_entry (6 Filters Validation Logic Added)
+    # 💡 स्मार्ट स्कोरिंग सिस्टम (जिज्ञासा और फ्लेक्सिबिलिटी के लिए ताकि ट्रेड मिस न हों)
     def check_entry(self, df):
         try:
             last = df.iloc[-1]
@@ -227,40 +225,52 @@ class TradingBot:
             cmf = last['cmf']
             supertrend = last['supertrend']
 
-            # लॉन्ग (Long) एंट्री के नियम (सभी 6 फिल्टर्स का मेल)
-            if (close > tema) and (close > vwap) and (close > supertrend) and (45 < rsi < 70) and (adx > 20) and (cmf > 0):
-                return 'long'
+            long_score = 0
+            short_score = 0
 
-            # शॉर्ट (Short) एंट्री के नियम (सभी 6 फिल्टर्स का मेल)
-            elif (close < tema) and (close < vwap) and (close < supertrend) and (30 < rsi < 55) and (adx > 20) and (cmf < 0):
-                return 'short'
+            # लॉन्ग कंडीशंस (हर मैच पर 1 पॉइंट)
+            if close > tema: long_score += 1
+            if close > vwap: long_score += 1
+            if close > supertrend: long_score += 1
+            if 45 < rsi < 70: long_score += 1
+            if adx > 20: long_score += 1
+            if cmf > 0: long_score += 1
+
+            # शॉर्ट कंडीशंस (हर मैच पर 1 पॉइंट)
+            if close < tema: short_score += 1
+            if close < vwap: short_score += 1
+            if close < supertrend: short_score += 1
+            if 30 < rsi < 55: short_score += 1
+            if adx > 20: short_score += 1
+            if cmf < 0: short_score += 1
+
+            # यदि कम से कम 4 या अधिक इंडिकेटर्स फेवर में हैं, तो सिग्नल पास हो जाएगा
+            if long_score >= 4 and long_score > short_score:
+                return 'long', long_score
+            elif short_score >= 4 and short_score > long_score:
+                return 'short', short_score
 
         except Exception as e:
             logging.error(f"Check Entry Error: {e}")
-        return None
+        return None, 0
 
-    # 3. calculate_lot (Real Balance & Risk Based Lot Calculation)
     def calculate_lot(self, symbol, price):
         try:
             balance = self.cached_balance if self.cached_balance > 0 else self.get_balance()
             if balance <= 0:
-                balance = 1000  # फॉलबैक बैलेंस अगर API न मिले
+                balance = 1000
             
-            # रिस्क मैनेजमेंट के हिसाब से लॉट साइज (अकाउंट बैलेंस का 1% रिस्क)
             risk_amount = balance * 0.01
             notional_amount = risk_amount * self.LEVERAGE
             lot = notional_amount / price
             
-            # एक्सचेंज के मिनिमम साइज के अनुसार राउंड ऑफ (जैसे 3 डेसिमल)
             return round(lot, 3)
         except Exception as e:
             logging.error(f"Calculate Lot Error: {e}")
             return 0.001
 
-    # 4. place_order (Real CCXT Order Execution Code)
     def place_order(self, symbol, side, lot, price):
         try:
-            # डेल्टा या किसी भी फ्यूचर्स एक्सचेंज पर मार्केट आर्डर प्लेस करना
             order = self.exchange.create_order(
                 symbol=symbol,
                 type='market',
