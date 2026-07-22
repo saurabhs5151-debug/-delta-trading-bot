@@ -1,3 +1,4 @@
+import os
 import time
 import logging
 from datetime import datetime
@@ -5,7 +6,6 @@ import pandas as pd
 import pandas_ta as ta
 import ccxt
 import requests
-import os
 from dotenv import load_dotenv
 
 # .dotenv फाइल से सेंसिटिव डेटा लोड करने के लिए
@@ -36,7 +36,7 @@ class TradingBot:
         self.active_trades = {}
         self.pending_entry = {}
         self.last_alert_time = {}
-        self.last_alert_seconds = {}
+        self.last_heartbeat_time = {} # हर 2 मिनट के क्लीन लाइव प्राइस के लिए
         
         # CCXT एक्सचेंज सेटअप - .env फाइल के असली और सटीक नाम
         self.exchange = ccxt.delta({
@@ -47,9 +47,10 @@ class TradingBot:
         })
 
     def run(self):
-        send_telegram("🟢 Bot Loop Started Successfully (Universal Rules & Exact ADX Leverage Mode).")
+        send_telegram("🟢 *Bot Loop Started Successfully*\n(Clean 2-Min Live Price & Strict Indicator Rules Active)")
         while True:
             try:
+                # 1. नए दिन पर PnL रिसेट
                 if datetime.now().date() != self.today_date:
                     self.daily_pnl = 0
                     self.today_date = datetime.now().date()
@@ -61,12 +62,27 @@ class TradingBot:
                         self.LEVERAGE = 5
                         send_telegram("⚠️ Daily Loss Limit Hit! Leverage → 5x")
 
+                # बैलेंस चेक हर 5 मिनट में
                 if time.time() - self.last_balance_check > 300:
                     self.cached_balance = self.get_balance()
                     self.last_balance_check = time.time()
 
                 for symbol in self.symbols:
-                    # ATR Spike चेक (News Volatility Filter)
+                    # 2. हर 2 मिनट में बिना किसी शर्त के साफ-सुथरा लाइव प्राइस अपडेट
+                    df_price_check = self.fetch_indicators(symbol, '1m', limit=5)
+                    if df_price_check is not None and not df_price_check.empty:
+                        current_price = df_price_check['close'].iloc[-1]
+                        current_adx = df_price_check['adx'].iloc[-1]
+                        
+                        now_time = time.time()
+                        if symbol not in self.last_heartbeat_time:
+                            self.last_heartbeat_time[symbol] = 0
+
+                        if now_time - self.last_heartbeat_time[symbol] >= 120:
+                            self.last_heartbeat_time[symbol] = now_time
+                            send_telegram(f"⚡ *{symbol} Live Update*\nPrice: `{current_price:.2f}` | ADX: `{current_adx:.1f}`")
+
+                    # 3. ATR Spike चेक (News Volatility Filter)
                     if self.is_volatile_news(symbol):
                         if symbol in self.active_trades:
                             self.emergency_exit(symbol)
@@ -76,10 +92,9 @@ class TradingBot:
                     if df_1m is None or len(df_1m) < 30:
                         continue
 
-                    current_price = df_1m['close'].iloc[-1]
                     current_adx = df_1m['adx'].iloc[-1]
 
-                    # 💡 आपके बिल्कुल सटीक ADX लेवरेज नियम (सबके लिए एक समान)
+                    # 💡 सटीक ADX लेवरेज नियम
                     if current_adx >= 25:
                         self.LEVERAGE = 50  # ADX 25 के ऊपर → 50x लेवरेज
                     elif current_adx >= 22:
@@ -87,16 +102,7 @@ class TradingBot:
                     else:
                         self.LEVERAGE = 5   # ADX 20 के अंदर/नीचे → 5x लेवरेज
 
-                    # हर 2 मिनट (120 सेकंड) में रेट और बॉट एक्टिविटी का अलर्ट (Heartbeat Update)
-                    now_time = time.time()
-                    if symbol not in self.last_alert_seconds:
-                        self.last_alert_seconds[symbol] = 0
-
-                    if now_time - self.last_alert_seconds[symbol] >= 120:
-                        self.last_alert_seconds[symbol] = now_time
-                        send_telegram(f"📊 *{symbol} Heartbeat Update*\nPrice: `{current_price:.2f}` | ADX: `{current_adx:.1f}` | Lev: `{self.LEVERAGE}x` | Status: *Running Active*")
-
-                    # 1m कैंडल क्लोज पर सिग्नल चेक
+                    # 4. 1m कैंडल क्लोज पर सिग्नल चेक (नियम और स्कोरिंग)
                     last_ts = str(df_1m.index[-1])
                     if self.last_alert_time.get(symbol) != last_ts:
                         self.last_alert_time[symbol] = last_ts
@@ -105,7 +111,7 @@ class TradingBot:
                             self.pending_entry[symbol] = {'signal': signal, 'score': score}
                             send_telegram(f"🔔 *Smart Alert*: {symbol} Signal -> *{signal.upper()}* (Score: {score}/6) | Lev: {self.LEVERAGE}x")
 
-                    # 5m कन्फर्मेशन के बाद रियल ट्रेड लेना (स्मार्ट स्कोरिंग के साथ)
+                    # 5. 5m कन्फर्मेशन के बाद रियल ट्रेड लेना (नियमों के तहत)
                     if self.pending_entry.get(symbol) and symbol not in self.active_trades:
                         df_5m = self.fetch_indicators(symbol, '5m', limit=100)
                         if df_5m is not None and len(df_5m) > 30:
@@ -134,6 +140,7 @@ class TradingBot:
                                         self.save_trade_state()
                                         send_telegram(f"🎯 *Trade Executed ({symbol})*\nSide: *{side.upper()}*\nLot: `{lot}`\nPrice: `{price}`\nLeverage: `{self.LEVERAGE}x`\nSL: `{sl_price:.2f}`")
 
+                # 6. एक्टिव ट्रेड मैनेजमेंट (SL और एग्जिट)
                 for symbol in list(self.active_trades.keys()):
                     trade = self.active_trades[symbol]
                     df_price = self.fetch_indicators(symbol, '1m', limit=10)
@@ -257,7 +264,7 @@ class TradingBot:
         try:
             balance = self.cached_balance if self.cached_balance > 0 else self.get_balance()
             if balance <= 0:
-                balance = 10  # फॉलबैक बैलेंस
+                balance = 10
             
             notional_amount = balance * self.LEVERAGE * 0.5
             lot = notional_amount / price
@@ -290,7 +297,7 @@ class TradingBot:
     def save_trade_state(self):
         pass
 
-    def partial_book(self, symbol, trade, current_price):
+    def partial_book(self, symbol, trade, current_press):
         pass
 
     def update_trailing_sl(self, symbol, trade, current_price):
