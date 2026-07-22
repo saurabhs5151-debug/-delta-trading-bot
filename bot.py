@@ -43,7 +43,7 @@ class TradingBot:
         })
 
     def run(self):
-        send_telegram("🟢 Bot Loop Started Successfully (Smart Leverage & Heartbeat Mode Active).")
+        send_telegram("🟢 Bot Loop Started Successfully (Universal Rules & Exact ADX Leverage Mode).")
         while True:
             try:
                 if datetime.now().date() != self.today_date:
@@ -75,15 +75,15 @@ class TradingBot:
                     current_price = df_1m['close'].iloc[-1]
                     current_adx = df_1m['adx'].iloc[-1]
 
-                    # 💡 आपके नियम के अनुसार ADX पर आधारित डायनामिक लेवरेज सेट करना
+                    # 💡 आपके बिल्कुल सटीक ADX लेवरेज नियम (सबके लिए एक समान)
                     if current_adx >= 25:
-                        self.LEVERAGE = 30  # मजबूत ट्रेंड में हाई लेवरेज (25x - 50x के बीच)
+                        self.LEVERAGE = 50  # ADX 25 के ऊपर → 50x लेवरेज
                     elif current_adx >= 22:
-                        self.LEVERAGE = 15  # मध्यम ट्रेंड में मीडियम लेवरेज (10x - 20x)
+                        self.LEVERAGE = 20  # ADX 22 के ऊपर → 10x से 20x लेवरेज (यहाँ 20x सेट किया है)
                     else:
-                        self.LEVERAGE = 5   # कमजोर/साइडवेज मार्केट में सेफ लेवरेज (5x)
+                        self.LEVERAGE = 5   # ADX 20 के अंदर/नीचे → 5x लेवरेज
 
-                    # हर 2 मिनट (120 सेकंड) में रेट और बॉट एक्टिविटी का अलर्ट (Heartbeat)
+                    # हर 2 मिनट (120 सेकंड) में रेट और बॉट एक्टिविटी का अलर्ट (Heartbeat Update)
                     now_time = time.time()
                     if symbol not in self.last_alert_seconds:
                         self.last_alert_seconds[symbol] = 0
@@ -106,7 +106,6 @@ class TradingBot:
                         df_5m = self.fetch_indicators(symbol, '5m', limit=100)
                         if df_5m is not None and len(df_5m) > 30:
                             signal_5m, score_5m = self.check_entry(df_5m)
-                            # यदि स्कोर कम से कम 4 या उससे अधिक है, तो ट्रेड ले लें ताकि मौके हाथ से न छूटें
                             if signal_5m == self.pending_entry[symbol]['signal'] and score_5m >= 4:
                                 price = df_5m['close'].iloc[-1]
                                 atr = df_5m['atr'].iloc[-1]
@@ -213,7 +212,6 @@ class TradingBot:
             logging.error(f"Error fetching indicators for {symbol}: {e}")
             return None
 
-    # 💡 स्मार्ट स्कोरिंग सिस्टम (जिज्ञासा और फ्लेक्सिबिलिटी के लिए ताकि ट्रेड मिस न हों)
     def check_entry(self, df):
         try:
             last = df.iloc[-1]
@@ -228,7 +226,6 @@ class TradingBot:
             long_score = 0
             short_score = 0
 
-            # लॉन्ग कंडीशंस (हर मैच पर 1 पॉइंट)
             if close > tema: long_score += 1
             if close > vwap: long_score += 1
             if close > supertrend: long_score += 1
@@ -236,7 +233,6 @@ class TradingBot:
             if adx > 20: long_score += 1
             if cmf > 0: long_score += 1
 
-            # शॉर्ट कंडीशंस (हर मैच पर 1 पॉइंट)
             if close < tema: short_score += 1
             if close < vwap: short_score += 1
             if close < supertrend: short_score += 1
@@ -244,7 +240,6 @@ class TradingBot:
             if adx > 20: short_score += 1
             if cmf < 0: short_score += 1
 
-            # यदि कम से कम 4 या अधिक इंडिकेटर्स फेवर में हैं, तो सिग्नल पास हो जाएगा
             if long_score >= 4 and long_score > short_score:
                 return 'long', long_score
             elif short_score >= 4 and short_score > long_score:
@@ -254,17 +249,22 @@ class TradingBot:
             logging.error(f"Check Entry Error: {e}")
         return None, 0
 
+    # 💡 सबके लिए एक समान (Universal) लॉट साइज कैलकुलेशन - बैलेंस और लेवरेज के आधार पर
     def calculate_lot(self, symbol, price):
         try:
             balance = self.cached_balance if self.cached_balance > 0 else self.get_balance()
             if balance <= 0:
-                balance = 1000
+                balance = 10  # फॉलबैक बैलेंस
             
-            risk_amount = balance * 0.01
-            notional_amount = risk_amount * self.LEVERAGE
+            # उपलब्ध बैलेंस और वर्तमान लेवरेज के अनुपात में ट्रेड साइज
+            notional_amount = balance * self.LEVERAGE * 0.5  # बैलेंस का 50% मार्जिन इस्तेमाल करके पोजीशन
             lot = notional_amount / price
             
-            return round(lot, 3)
+            min_lot = 0.001 if 'BTC' in symbol else 0.01
+            if lot < min_lot:
+                lot = min_lot
+                
+            return round(lot, 4)
         except Exception as e:
             logging.error(f"Calculate Lot Error: {e}")
             return 0.001
