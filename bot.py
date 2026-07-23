@@ -2,7 +2,7 @@ import time
 import json
 import os
 import logging
-import requests  # टेलीग्राम मैसेज भेजने के लिए जरूरी
+import requests
 from datetime import datetime
 
 # ==========================================
@@ -14,12 +14,12 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 
-# टेलीग्राम बॉट टोकन और चैट आईडी यहाँ सेट करें
-TELEGRAM_BOT_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"  # अपना बोट टोकन यहाँ डालें
-TELEGRAM_CHAT_ID = "YOUR_TELEGRAM_CHAT_ID"      # अपनी चैट आईडी यहाँ डालें
+# यहाँ अपना टेलीग्राम बॉट टोकन और चैट आईडी दर्ज करें
+TELEGRAM_BOT_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"
+TELEGRAM_CHAT_ID = "YOUR_TELEGRAM_CHAT_ID"
 
 def send_telegram_alert(message):
-    """टेलीग्राम पर तुरंत लाइव अलर्ट भेजने का फंक्शन"""
+    """टेलीग्राम पर तुरंत लाइव अलर्ट भेजने का सुरक्षित फंक्शन"""
     if TELEGRAM_BOT_TOKEN == "YOUR_TELEGRAM_BOT_TOKEN":
         logging.warning("Telegram Token not set. Skipping telegram alert.")
         return
@@ -65,13 +65,13 @@ def save_state(state):
         logging.error(f"State save error: {e}")
 
 # ==========================================
-# 3. PRIME SCALP BOT ENGINE (WITH TELEGRAM)
+# 3. PRIME SCALP VERIFIED BOT ENGINE
 # ==========================================
-class PrimeScalpTelegramBot:
+class PrimeScalpVerifiedBot:
     def __init__(self):
         self.state = load_state()
         self.symbols = ["BTC/USD", "ETH/USD"]
-        logging.info("Prime Scalp Bot initialized with Telegram Alerts.")
+        logging.info("Prime Scalp Verified Bot initialized successfully.")
 
     def get_market_data(self, symbol):
         return {
@@ -138,7 +138,7 @@ class PrimeScalpTelegramBot:
         
         price_diff = (current_price - entry_price) if side == "BUY" else (entry_price - current_price)
 
-        # Partial Booking 25% -> Breakeven
+        # 1. Partial Booking 25% -> Breakeven SL
         if not self.state["partial_booked_25"] and price_diff >= (atr * 1.5):
             msg = f"Partial Booking 25% done for {symbol}. Moving SL to Breakeven."
             logging.info(msg)
@@ -147,7 +147,7 @@ class PrimeScalpTelegramBot:
             self.state["current_sl"] = entry_price
             save_state(self.state)
 
-        # Partial Booking 50% -> Trailing SL
+        # 2. Partial Booking 50% -> Trailing SL (ATR x 2.0)
         if not self.state["partial_booked_50"] and price_diff >= (atr * 2.5):
             msg = f"Partial Booking 50% done for {symbol}. Activating ATR x 2.0 Trailing SL."
             logging.info(msg)
@@ -155,7 +155,7 @@ class PrimeScalpTelegramBot:
             self.state["partial_booked_50"] = True
             save_state(self.state)
 
-        # Trailing SL Update
+        # 3. Trailing SL Dynamic Update
         if self.state["partial_booked_50"]:
             if side == "BUY":
                 new_trail_sl = current_price - (atr * 2.0)
@@ -172,7 +172,7 @@ class PrimeScalpTelegramBot:
                 self.flatten_trade("Trailing SL Hit")
                 return
 
-        # Stalling Sensor
+        # 4. Stalling Sensor (ATR-based Range = ATR x 1.5)
         stalling_range = atr * 1.5
         if abs(price_diff) < stalling_range:
             elapsed_active_min = (time.time() - trade["entry_time"]) / 60
@@ -184,18 +184,18 @@ class PrimeScalpTelegramBot:
                 self.flatten_trade("Stalling Sensor Time Exit")
                 return
 
-        # Volatility Spike
+        # 5. Volatility Spike Emergency Exit
         if data["current_1m_close"] > data["high_5m"] or data["current_1m_close"] < data["low_5m"]:
             self.flatten_trade("Volatility Spike Emergency Exit")
             return
 
-        # Hard Time Exit (29 mins)
+        # 6. Hard Time Exit (29 Mins)
         elapsed_time = (time.time() - trade["entry_time"]) / 60
         if elapsed_time >= 29:
             self.flatten_trade("29 Mins Hard Time Exit")
 
     def run_trading_loop(self):
-        logging.info("Starting 24/7 Prime Scalp Loop with Telegram Alerts...")
+        logging.info("Starting 24/7 Verified Prime Scalp Loop...")
         send_telegram_alert("🟢 Prime Scalp Bot successfully started and running on AWS!")
         
         while True:
@@ -236,12 +236,10 @@ class PrimeScalpTelegramBot:
                             self.state["current_sl"] = initial_sl
                             save_state(self.state)
                             
-                            # टेलीग्राम अलर्ट भेजना जब नया ट्रेड खुले
                             alert_msg = f"✅ *New Trade Executed*\nSymbol: {symbol}\nPrice: {data['price']}\nLeverage: {leverage}x\nLot: {lot}"
                             logging.info(alert_msg)
                             send_telegram_alert(alert_msg)
 
-                # प्रत्येक 2 मिनट (120 सेकंड) में लूप चेक और लाइव स्टेटस अपडेट
                 time.sleep(120)
 
             except Exception as e:
@@ -251,7 +249,7 @@ class PrimeScalpTelegramBot:
                 time.sleep(10)
 
 if __name__ == "__main__":
-    bot = PrimeScalpTelegramBot()
+    bot = PrimeScalpVerifiedBot()
     try:
         bot.run_trading_loop()
     except KeyboardInterrupt:
