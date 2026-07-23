@@ -8,7 +8,6 @@ import ccxt
 import requests
 from dotenv import load_dotenv
 
-# .dotenv फाइल लोड करें
 load_dotenv()
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -30,15 +29,14 @@ class TradingBot:
         self.today_date = datetime.now().date()
         self.daily_pnl = 0
         self.DAILY_LOSS_LIMIT = -100
-        self.LEVERAGE = 5  
+        self.LEVERAGE = 5
         self.last_balance_check = 0
         self.cached_balance = 0
         self.active_trades = {}
         self.pending_entry = {}
         self.last_alert_time = {}
-        self.last_heartbeat_time = {}  # हर 2 मिनट के फिक्स लाइव प्राइस के लिए
+        self.last_heartbeat_time = {}
         
-        # CCXT एक्सचेंज सेटअप
         self.exchange = ccxt.delta({
             'apiKey': os.getenv("DELTA_API_KEY"),
             'secret': os.getenv("DELTA_API_SECRET"),
@@ -47,10 +45,9 @@ class TradingBot:
         })
 
     def run(self):
-        send_telegram("🟢 *Bot Loop Started Successfully*\n(2-Min Independent Live Price & Full Trading Rules Active)")
+        send_telegram("🟢 Prime Scalp Bot Started (Complete 25-50-25 Partial Booking + Min Lot Flexibility)")
         while True:
             try:
-                # 1. नए दिन पर PnL रिसेट
                 if datetime.now().date() != self.today_date:
                     self.daily_pnl = 0
                     self.today_date = datetime.now().date()
@@ -62,28 +59,23 @@ class TradingBot:
                         self.LEVERAGE = 5
                         send_telegram("⚠️ Daily Loss Limit Hit! Leverage → 5x")
 
-                # बैलेंस चेक हर 5 मिनट में
                 if time.time() - self.last_balance_check > 300:
                     self.cached_balance = self.get_balance()
                     self.last_balance_check = time.time()
 
                 for symbol in self.symbols:
-                    # 2. **बिल्कुल स्वतंत्र 2 मिनट वाला लाइव प्राइस अपडेट (बिنا किसी इंडिकेटर शर्त के)**
                     try:
                         ticker = self.exchange.fetch_ticker(symbol)
                         current_price = ticker['last']
-                        
                         now_time = time.time()
                         if symbol not in self.last_heartbeat_time:
                             self.last_heartbeat_time[symbol] = 0
-
                         if now_time - self.last_heartbeat_time[symbol] >= 120:
                             self.last_heartbeat_time[symbol] = now_time
                             send_telegram(f"⚡ *{symbol} Live Update*\nPrice: `{current_price:.2f}`")
                     except Exception as e:
                         logging.error(f"Live Price Fetch Error for {symbol}: {e}")
 
-                    # 3. ATR Spike चेक (News Volatility Filter)
                     if self.is_volatile_news(symbol):
                         if symbol in self.active_trades:
                             self.emergency_exit(symbol)
@@ -94,54 +86,54 @@ class TradingBot:
                         continue
 
                     current_adx = df_1m['adx'].iloc[-1]
-
-                    # 💡 सटीक ADX लेवरेज नियम
                     if current_adx >= 25:
-                        self.LEVERAGE = 50  
+                        self.LEVERAGE = 50
                     elif current_adx >= 22:
-                        self.LEVERAGE = 20  
+                        self.LEVERAGE = 20
                     else:
-                        self.LEVERAGE = 5   
+                        self.LEVERAGE = 5
 
-                    # 4. 1m कैंडल क्लोज पर सिग्नल चेक (6 इंडिकेटर्स और स्कोरिंग नियम)
                     last_ts = str(df_1m.index[-1])
                     if self.last_alert_time.get(symbol) != last_ts:
                         self.last_alert_time[symbol] = last_ts
-                        signal, score = self.check_entry(df_1m)
-                        if signal and symbol not in self.active_trades:
-                            self.pending_entry[symbol] = {'signal': signal, 'score': score}
-                            send_telegram(f"🔔 *Smart Alert*: {symbol} Signal -> *{signal.upper()}* (Score: {score}/6) | Lev: {self.LEVERAGE}x")
+                        result = self.check_entry(df_1m)
+                        if result is not None:
+                            signal, score = result
+                            if signal and symbol not in self.active_trades:
+                                self.pending_entry[symbol] = {'signal': signal, 'score': score}
+                                send_telegram(f"🔔 *Smart Alert*: {symbol} Signal -> *{signal.upper()}* (Score: {score}/6) | Lev: {self.LEVERAGE}x")
 
-                    # 5. 5m कन्फर्मेशन के बाद रियल ट्रेड लेना
                     if self.pending_entry.get(symbol) and symbol not in self.active_trades:
                         df_5m = self.fetch_indicators(symbol, '5m', limit=100)
                         if df_5m is not None and len(df_5m) > 30:
-                            signal_5m, score_5m = self.check_entry(df_5m)
-                            if signal_5m == self.pending_entry[symbol]['signal'] and score_5m >= 4:
-                                price = df_5m['close'].iloc[-1]
-                                atr = df_5m['atr'].iloc[-1]
-                                lot = self.calculate_lot(symbol, price)
-                                if lot > 0:
-                                    side = 'buy' if signal_5m == 'long' else 'sell'
-                                    order = self.place_order(symbol, side, lot, price)
-                                    if order:
-                                        sl_price = price - (atr * 1.0) if signal_5m == 'long' else price + (atr * 1.0)
-                                        self.active_trades[symbol] = {
-                                            'entry_price': price,
-                                            'direction': signal_5m,
-                                            'total_amount': lot,
-                                            'remaining_amount': lot,
-                                            'sl_price': sl_price,
-                                            'atr': atr,
-                                            'entry_time': datetime.now(),
-                                            'stage': 0, 
-                                            'stall_triggered': False
-                                        }
-                                        self.pending_entry[symbol] = None
-                                        self.save_trade_state()
-                                        send_telegram(f"🎯 *Trade Executed ({symbol})*\nSide: *{side.upper()}*\nLot: `{lot}`\nPrice: `{price}`\nLeverage: `{self.LEVERAGE}x`\nSL: `{sl_price:.2f}`")
+                            result_5m = self.check_entry(df_5m)
+                            if result_5m is not None:
+                                signal_5m, score_5m = result_5m
+                                if signal_5m == self.pending_entry[symbol]['signal'] and score_5m >= 4:
+                                    price = df_5m['close'].iloc[-1]
+                                    atr = df_5m['atr'].iloc[-1]
+                                    lot = self.calculate_lot(symbol, price)
+                                    if lot > 0:
+                                        side = 'buy' if signal_5m == 'long' else 'sell'
+                                        order = self.place_order(symbol, side, lot, price)
+                                        if order:
+                                            sl_price = price - (atr * 1.0) if signal_5m == 'long' else price + (atr * 1.0)
+                                            self.active_trades[symbol] = {
+                                                'entry_price': price,
+                                                'direction': signal_5m,
+                                                'total_amount': lot,
+                                                'remaining_amount': lot,
+                                                'sl_price': sl_price,
+                                                'atr': atr,
+                                                'entry_time': datetime.now(),
+                                                'stage': 0,
+                                                'stall_triggered': False,
+                                                'stall_time': None
+                                            }
+                                            self.pending_entry[symbol] = None
+                                            self.save_trade_state()
+                                            send_telegram(f"🎯 *Trade Executed ({symbol})*\nSide: *{side.upper()}*\nLot: `{lot}`\nPrice: `{price}`\nLeverage: `{self.LEVERAGE}x`\nSL: `{sl_price:.2f}`")
 
-                # 6. एक्टिव ट्रेड मैनेजमेंट (पार्शियल बुकिंग, ट्रेलिंग एसएल और एग्जिट नियम)
                 for symbol in list(self.active_trades.keys()):
                     trade = self.active_trades[symbol]
                     df_price = self.fetch_indicators(symbol, '1m', limit=10)
@@ -151,6 +143,8 @@ class TradingBot:
                     
                     self.partial_book(symbol, trade, current)
                     self.update_trailing_sl(symbol, trade, current)
+                    self.check_stalling(symbol, trade, df_price)
+                    self.check_volatility_spike(symbol, trade, df_price)
                     
                     if self.check_exit_conditions(symbol, trade):
                         self.emergency_exit(symbol)
@@ -265,19 +259,22 @@ class TradingBot:
         try:
             balance = self.cached_balance if self.cached_balance > 0 else self.get_balance()
             if balance <= 0:
-                balance = 10
+                balance = 1  # भले ही $1 हो, ट्रेड नहीं रुकेगा
+
+            # मिनिमम लॉट साइज़ सेट किया गया है (BTC के लिए 0.001, ETH के लिए 0.01)
+            min_lot = 0.001 if 'BTC' in symbol else 0.01
             
             notional_amount = balance * self.LEVERAGE * 0.5
             lot = notional_amount / price
             
-            min_lot = 0.001 if 'BTC' in symbol else 0.01
+            # यदि कैलकुलेटेड लॉट मिनिमम से भी कम है, तो भी एक्सचेंज का मिनिमम लॉट लागू होगा ताकि $1 में भी ट्रेड चल सके
             if lot < min_lot:
                 lot = min_lot
                 
             return round(lot, 4)
         except Exception as e:
             logging.error(f"Calculate Lot Error: {e}")
-            return 0.001
+            return 0.001 if 'BTC' in symbol else 0.01
 
     def place_order(self, symbol, side, lot, price):
         try:
@@ -295,43 +292,99 @@ class TradingBot:
             logging.error(f"Order Placement Error: {e}")
             return None
 
-    def save_trade_state(self):
-        pass
-
     def partial_book(self, symbol, trade, current_price):
         try:
             entry = trade['entry_price']
             direction = trade['direction']
             atr = trade['atr']
+            stage = trade.get('stage', 0)
+            total = trade['total_amount']
             
-            if direction == 'long' and current_price >= entry + (atr * 1.0) and trade['stage'] == 0:
-                book_amount = trade['total_amount'] * 0.5
-                self.exchange.create_order(symbol, 'market', 'sell', book_amount, params={'reduceOnly': True})
-                trade['remaining_amount'] -= book_amount
-                trade['stage'] = 1
-                trade['sl_price'] = entry  
-                send_telegram(f"💰 *Partial Profit Booked (Long)*: {symbol} @ `{current_price}` | SL shifted to Cost")
-                
-            elif direction == 'short' and current_price <= entry - (atr * 1.0) and trade['stage'] == 0:
-                book_amount = trade['total_amount'] * 0.5
-                self.exchange.create_order(symbol, 'market', 'buy', book_amount, params={'reduceOnly': True})
-                trade['remaining_amount'] -= book_amount
-                trade['stage'] = 1
-                trade['sl_price'] = entry  
-                send_telegram(f"💰 *Partial Profit Booked (Short)*: {symbol} @ `{current_price}` | SL shifted to Cost")
+            if stage == 0:
+                tp1 = entry + (atr * 1.5) if direction == 'long' else entry - (atr * 1.5)
+                if (direction == 'long' and current_price >= tp1) or (direction == 'short' and current_price <= tp1):
+                    qty = round(total * 0.25, 4)
+                    min_qty = 0.001 if 'BTC' in symbol else 0.01
+                    if qty < min_qty: qty = min_qty
+                    side = 'sell' if direction == 'long' else 'buy'
+                    self.exchange.create_order(symbol, 'market', side, qty, params={'reduceOnly': True})
+                    trade['remaining_amount'] -= qty
+                    trade['stage'] = 1
+                    trade['sl_price'] = entry
+                    send_telegram(f"💰 25% Booked ({direction.upper()}) {symbol} @ {current_price:.2f}")
+            
+            elif stage == 1:
+                tp2 = entry + (atr * 2.5) if direction == 'long' else entry - (atr * 2.5)
+                if (direction == 'long' and current_price >= tp2) or (direction == 'short' and current_price <= tp2):
+                    qty = round(total * 0.50, 4)
+                    min_qty = 0.001 if 'BTC' in symbol else 0.01
+                    if qty < min_qty: qty = min_qty
+                    side = 'sell' if direction == 'long' else 'buy'
+                    self.exchange.create_order(symbol, 'market', side, qty, params={'reduceOnly': True})
+                    trade['remaining_amount'] -= qty
+                    trade['stage'] = 2
+                    trade['sl_price'] = entry + (atr * 2.0) if direction == 'long' else entry - (atr * 2.0)
+                    send_telegram(f"💰 50% Booked ({direction.upper()}) {symbol} @ {current_price:.2f}")
         except Exception as e:
             logging.error(f"Partial Booking Error: {e}")
 
     def update_trailing_sl(self, symbol, trade, current_price):
-        pass
+        try:
+            if trade.get('stage', 0) >= 2:
+                atr = trade['atr']
+                if trade['direction'] == 'long':
+                    new_sl = current_price - (atr * 2.0)
+                    if new_sl > trade['sl_price']:
+                        trade['sl_price'] = new_sl
+                else:
+                    new_sl = current_price + (atr * 2.0)
+                    if new_sl < trade['sl_price']:
+                        trade['sl_price'] = new_sl
+        except Exception as e:
+            logging.error(f"Trailing SL Error: {e}")
+
+    def check_stalling(self, symbol, trade, df_price):
+        try:
+            if len(df_price) >= 5:
+                atr = trade['atr']
+                recent_range = df_price['high'].iloc[-5:].max() - df_price['low'].iloc[-5:].min()
+                if recent_range <= (atr * 1.5):
+                    if not trade.get('stall_triggered'):
+                        trade['stall_triggered'] = True
+                        trade['stall_time'] = datetime.now()
+                        trade['sl_price'] = trade['entry_price']
+                        send_telegram(f"⏸️ Stalling Detected: {symbol} | SL Breakeven")
+                    elif (datetime.now() - trade['stall_time']).total_seconds() > 120:
+                        send_telegram(f"🛑 Stalling Exit: {symbol}")
+                        self.emergency_exit(symbol)
+        except Exception as e:
+            logging.error(f"Stalling Check Error: {e}")
+
+    def check_volatility_spike(self, symbol, trade, df_price):
+        try:
+            if len(df_price) >= 10:
+                df_5m = self.fetch_indicators(symbol, '5m', limit=5)
+                if df_5m is not None and len(df_5m) > 0:
+                    if df_price['high'].iloc[-1] > df_5m['high'].max() or df_price['low'].iloc[-1] < df_5m['low'].min():
+                        send_telegram(f"⚡ Volatility Spike: {symbol} | Emergency Exit")
+                        self.emergency_exit(symbol)
+        except Exception as e:
+            logging.error(f"Volatility Spike Check Error: {e}")
 
     def check_exit_conditions(self, symbol, trade):
+        elapsed = (datetime.now() - trade['entry_time']).total_seconds() / 60
+        if elapsed >= 29:
+            send_telegram(f"⏰ Time Exit: {symbol} | 29 minutes")
+            return True
         return False
+
+    def save_trade_state(self):
+        pass
 
     def emergency_exit(self, symbol):
         if symbol in self.active_trades:
             del self.active_trades[symbol]
-            send_telegram(f"🛑 *Emergency Exit / Close*: {symbol}")
+            send_telegram(f"🛑 Exit: {symbol}")
 
 if __name__ == "__main__":
     bot = TradingBot()
