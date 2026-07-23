@@ -1,5 +1,6 @@
 import os
 import time
+import json
 import logging
 from datetime import datetime
 import pandas as pd
@@ -26,7 +27,7 @@ logging.basicConfig(filename='bot_log.log', level=logging.INFO, format='%(asctim
 class TradingBot:
     def __init__(self):
         self.symbols = ['BTC/USDT', 'ETH/USDT']
-        self.today_date = datetime.now().date()
+        self.today_date = str(datetime.now().date())
         self.daily_pnl = 0
         self.DAILY_LOSS_LIMIT = -100
         self.LEVERAGE = 5
@@ -37,20 +38,26 @@ class TradingBot:
         self.last_alert_time = {}
         self.last_heartbeat_time = {}
         
-        self.exchange = ccxt.delta({
-            'apiKey': os.getenv("DELTA_API_KEY"),
-            'secret': os.getenv("DELTA_API_SECRET"),
-            'enableRateLimit': True,
-            'options': {'defaultType': 'swap'}
-        })
+        try:
+            self.exchange = ccxt.delta({
+                'apiKey': os.getenv("DELTA_API_KEY"),
+                'secret': os.getenv("DELTA_API_SECRET"),
+                'enableRateLimit': True,
+                'options': {'defaultType': 'swap'}
+            })
+        except Exception as e:
+            logging.error(f"Exchange Initialization Error: {e}")
+            
+        self.load_trade_state()
 
     def run(self):
-        send_telegram("🟢 Prime Scalp Bot Started (Complete 25-50-25 Partial Booking + Min Lot Flexibility)")
+        send_telegram("🟢 Prime Scalp Bot Started & Fully Stabilized")
         while True:
             try:
-                if datetime.now().date() != self.today_date:
+                current_date_str = str(datetime.now().date())
+                if current_date_str != self.today_date:
                     self.daily_pnl = 0
-                    self.today_date = datetime.now().date()
+                    self.today_date = current_date_str
                     self.save_trade_state()
                     send_telegram("📅 New Day - PnL Reset")
 
@@ -66,6 +73,8 @@ class TradingBot:
                 for symbol in self.symbols:
                     try:
                         ticker = self.exchange.fetch_ticker(symbol)
+                        if not ticker or 'last' not in ticker:
+                            continue
                         current_price = ticker['last']
                         now_time = time.time()
                         if symbol not in self.last_heartbeat_time:
@@ -75,6 +84,7 @@ class TradingBot:
                             send_telegram(f"⚡ *{symbol} Live Update*\nPrice: `{current_price:.2f}`")
                     except Exception as e:
                         logging.error(f"Live Price Fetch Error for {symbol}: {e}")
+                        continue
 
                     if self.is_volatile_news(symbol):
                         if symbol in self.active_trades:
@@ -85,7 +95,7 @@ class TradingBot:
                     if df_1m is None or len(df_1m) < 30:
                         continue
 
-                    current_adx = df_1m['adx'].iloc[-1]
+                    current_adx = df_1m['adx'].iloc[-1] if 'adx' in df_1m.columns else 25
                     if current_adx >= 25:
                         self.LEVERAGE = 50
                     elif current_adx >= 22:
@@ -111,7 +121,7 @@ class TradingBot:
                                 signal_5m, score_5m = result_5m
                                 if signal_5m == self.pending_entry[symbol]['signal'] and score_5m >= 4:
                                     price = df_5m['close'].iloc[-1]
-                                    atr = df_5m['atr'].iloc[-1]
+                                    atr = df_5m['atr'].iloc[-1] if 'atr' in df_5m.columns else (price * 0.01)
                                     lot = self.calculate_lot(symbol, price)
                                     if lot > 0:
                                         side = 'buy' if signal_5m == 'long' else 'sell'
@@ -125,7 +135,7 @@ class TradingBot:
                                                 'remaining_amount': lot,
                                                 'sl_price': sl_price,
                                                 'atr': atr,
-                                                'entry_time': datetime.now(),
+                                                'entry_time': str(datetime.now()),
                                                 'stage': 0,
                                                 'stall_triggered': False,
                                                 'stall_time': None
@@ -160,10 +170,13 @@ class TradingBot:
             except KeyboardInterrupt:
                 send_telegram("🛑 Bot stopped manually.")
                 break
+            except ccxt.NetworkError as ne:
+                logging.error(f"Network Error: {ne}")
+                time.sleep(15)
             except Exception as e:
-                send_telegram(f"💥 *Critical error*: {e}")
+                send_telegram(f"💥 *Critical error recovered*: {e}")
                 logging.error(f"Critical Loop Error: {e}")
-                time.sleep(60)
+                time.sleep(30)
 
     def get_balance(self):
         try:
@@ -176,11 +189,10 @@ class TradingBot:
     def is_volatile_news(self, symbol):
         try:
             df = self.fetch_indicators(symbol, '1m', limit=20)
-            if df is not None and len(df) >= 15:
+            if df is not None and len(df) >= 15 and 'atr' in df.columns:
                 current_atr = df['atr'].iloc[-1]
                 avg_atr = df['atr'][:-1].mean()
                 if current_atr > (avg_atr * 2.5):
-                    send_telegram(f"⚠️ *ATR Spike / News Detected* on {symbol}! Pausing trades.")
                     return True
         except Exception as e:
             logging.error(f"News Check Error: {e}")
@@ -189,6 +201,8 @@ class TradingBot:
     def fetch_indicators(self, symbol, timeframe, limit):
         try:
             ohlcv = self.exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
+            if not ohlcv:
+                return None
             df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
             df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
             df.set_index('timestamp', inplace=True)
@@ -220,6 +234,10 @@ class TradingBot:
 
     def check_entry(self, df):
         try:
+            required_cols = ['close', 'tema', 'vwap', 'rsi', 'adx', 'cmf', 'supertrend']
+            if not all(col in df.columns for col in required_cols):
+                return None, 0
+
             last = df.iloc[-1]
             close = last['close']
             tema = last['tema']
@@ -228,6 +246,10 @@ class TradingBot:
             adx = last['adx']
             cmf = last['cmf']
             supertrend = last['supertrend']
+
+            # अगर कोई वैल्यू NaN है तो एरर से बचने के लिए चेक करें
+            if pd.isna(tema) or pd.isna(vwap) or pd.isna(rsi) or pd.isna(adx) or pd.isna(cmf) or pd.isna(supertrend):
+                return None, 0
 
             long_score = 0
             short_score = 0
@@ -259,15 +281,12 @@ class TradingBot:
         try:
             balance = self.cached_balance if self.cached_balance > 0 else self.get_balance()
             if balance <= 0:
-                balance = 1  # भले ही $1 हो, ट्रेड नहीं रुकेगा
+                balance = 1
 
-            # मिनिमम लॉट साइज़ सेट किया गया है (BTC के लिए 0.001, ETH के लिए 0.01)
             min_lot = 0.001 if 'BTC' in symbol else 0.01
-            
             notional_amount = balance * self.LEVERAGE * 0.5
             lot = notional_amount / price
             
-            # यदि कैलकुलेटेड लॉट मिनिमम से भी कम है, तो भी एक्सचेंज का मिनिमम लॉट लागू होगा ताकि $1 में भी ट्रेड चल सके
             if lot < min_lot:
                 lot = min_lot
                 
@@ -311,6 +330,7 @@ class TradingBot:
                     trade['remaining_amount'] -= qty
                     trade['stage'] = 1
                     trade['sl_price'] = entry
+                    self.save_trade_state()
                     send_telegram(f"💰 25% Booked ({direction.upper()}) {symbol} @ {current_price:.2f}")
             
             elif stage == 1:
@@ -324,6 +344,7 @@ class TradingBot:
                     trade['remaining_amount'] -= qty
                     trade['stage'] = 2
                     trade['sl_price'] = entry + (atr * 2.0) if direction == 'long' else entry - (atr * 2.0)
+                    self.save_trade_state()
                     send_telegram(f"💰 50% Booked ({direction.upper()}) {symbol} @ {current_price:.2f}")
         except Exception as e:
             logging.error(f"Partial Booking Error: {e}")
@@ -345,18 +366,21 @@ class TradingBot:
 
     def check_stalling(self, symbol, trade, df_price):
         try:
-            if len(df_price) >= 5:
+            if len(df_price) >= 5 and 'high' in df_price.columns and 'low' in df_price.columns:
                 atr = trade['atr']
                 recent_range = df_price['high'].iloc[-5:].max() - df_price['low'].iloc[-5:].min()
                 if recent_range <= (atr * 1.5):
                     if not trade.get('stall_triggered'):
                         trade['stall_triggered'] = True
-                        trade['stall_time'] = datetime.now()
+                        trade['stall_time'] = str(datetime.now())
                         trade['sl_price'] = trade['entry_price']
+                        self.save_trade_state()
                         send_telegram(f"⏸️ Stalling Detected: {symbol} | SL Breakeven")
-                    elif (datetime.now() - trade['stall_time']).total_seconds() > 120:
-                        send_telegram(f"🛑 Stalling Exit: {symbol}")
-                        self.emergency_exit(symbol)
+                    elif trade.get('stall_time'):
+                        st_time = datetime.fromisoformat(trade['stall_time'])
+                        if (datetime.now() - st_time).total_seconds() > 120:
+                            send_telegram(f"🛑 Stalling Exit: {symbol}")
+                            self.emergency_exit(symbol)
         except Exception as e:
             logging.error(f"Stalling Check Error: {e}")
 
@@ -364,7 +388,7 @@ class TradingBot:
         try:
             if len(df_price) >= 10:
                 df_5m = self.fetch_indicators(symbol, '5m', limit=5)
-                if df_5m is not None and len(df_5m) > 0:
+                if df_5m is not None and len(df_5m) > 0 and 'high' in df_price.columns and 'high' in df_5m.columns:
                     if df_price['high'].iloc[-1] > df_5m['high'].max() or df_price['low'].iloc[-1] < df_5m['low'].min():
                         send_telegram(f"⚡ Volatility Spike: {symbol} | Emergency Exit")
                         self.emergency_exit(symbol)
@@ -372,18 +396,36 @@ class TradingBot:
             logging.error(f"Volatility Spike Check Error: {e}")
 
     def check_exit_conditions(self, symbol, trade):
-        elapsed = (datetime.now() - trade['entry_time']).total_seconds() / 60
-        if elapsed >= 29:
-            send_telegram(f"⏰ Time Exit: {symbol} | 29 minutes")
-            return True
+        try:
+            entry_time = datetime.fromisoformat(trade['entry_time'])
+            elapsed = (datetime.now() - entry_time).total_seconds() / 60
+            if elapsed >= 29:
+                send_telegram(f"⏰ Time Exit: {symbol} | 29 minutes")
+                return True
+        except Exception as e:
+            logging.error(f"Exit Condition Error: {e}")
         return False
 
     def save_trade_state(self):
-        pass
+        try:
+            with open('trade_state.json', 'w') as f:
+                json.dump(self.active_trades, f)
+        except Exception as e:
+            logging.error(f"Save State Error: {e}")
+
+    def load_trade_state(self):
+        try:
+            if os.path.exists('trade_state.json'):
+                with open('trade_state.json', 'r') as f:
+                    self.active_trades = json.load(f)
+                send_telegram(f"📂 Loaded {len(self.active_trades)} active trades from previous state.")
+        except Exception as e:
+            logging.error(f"Load State Error: {e}")
 
     def emergency_exit(self, symbol):
         if symbol in self.active_trades:
             del self.active_trades[symbol]
+            self.save_trade_state()
             send_telegram(f"🛑 Exit: {symbol}")
 
 if __name__ == "__main__":
