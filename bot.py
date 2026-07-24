@@ -7,8 +7,10 @@ from datetime import datetime
 from dotenv import load_dotenv
 import ccxt
 
-# .env फाइल से क्रेडेंशियल्स लोड करें
-load_dotenv()
+# .env फाइल को उसके सही पाथ के साथ लोड करें
+current_dir = os.path.dirname(os.path.abspath(__file__))
+dotenv_path = os.path.join(current_dir, '.env')
+load_dotenv(dotenv_path=dotenv_path)
 
 # ==========================================
 # 1. LOGGING & TELEGRAM CONFIG SETUP
@@ -19,8 +21,8 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "YOUR_TELEGRAM_CHAT_ID")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 DELTA_API_KEY = os.getenv("DELTA_API_KEY")
 DELTA_API_SECRET = os.getenv("DELTA_API_SECRET")
@@ -31,13 +33,12 @@ exchange = ccxt.delta({
     'secret': DELTA_API_SECRET,
     'enableRateLimit': True,
     'options': {
-        'defaultType': 'future', # डेल्टा फ्यूचर्स ट्रेडिंग के लिए
+        'defaultType': 'future',
     }
 })
 
 def send_telegram_alert(message):
-    """टेलीग्राम पर तुरंत लाइव अलर्ट भेजने का सुरक्षित फंक्शन"""
-    if TELEGRAM_BOT_TOKEN == "YOUR_TELEGRAM_BOT_TOKEN" or not TELEGRAM_BOT_TOKEN:
+    if not TELEGRAM_BOT_TOKEN:
         logging.warning("Telegram Token not set. Skipping telegram alert.")
         return
     
@@ -87,29 +88,26 @@ def save_state(state):
 class PrimeScalpVerifiedBot:
     def __init__(self):
         self.state = load_state()
-        self.symbols = ["BTC/USD:USDT", "ETH/USD:USDT"] # CCXT डेल्टा सिंबल फॉर्मेट
+        self.symbols = ["BTC/USD:USDT", "ETH/USD:USDT"]
         
         if not DELTA_API_KEY or not DELTA_API_SECRET:
             logging.error("CRITICAL ERROR: delta requires 'apiKey' credential from .env")
             send_telegram_alert("❌ CRITICAL ERROR: Delta API Key or Secret missing in .env file!")
         else:
-            logging.info("Delta API credentials loaded successfully.")
+            logging.info("Delta API credentials loaded successfully from .env.")
 
         logging.info("Prime Scalp Live Verified Bot initialized successfully.")
 
     def get_account_balance(self):
-        """असली डेल्टा एक्सचेंज अकाउंट से लाइव बैलेंस फेच करना ($1 हो या $1 लाख, 100% यूज़)"""
         try:
             balance_info = exchange.fetch_balance()
-            # USDT वॉलेट बैलेंस फैच करना (या मार्जिन बैलेंस)
             usdt_balance = float(balance_info['USDT']['free']) if 'USDT' in balance_info else 0.0
             if usdt_balance <= 0:
-                # यदि फ्री बैलेंस USDT में न दिखे तो टोटल चेक करें
                 usdt_balance = float(balance_info['total'].get('USDT', 1.0))
             return usdt_balance
         except Exception as e:
             logging.error(f"Balance fetch error from Delta: {e}")
-            return 1.0 # फॉールबैक ताकि बोट रुके नहीं
+            return 1.0
 
     def get_market_data(self, symbol):
         try:
@@ -152,13 +150,11 @@ class PrimeScalpVerifiedBot:
     def calculate_lot(self, balance, leverage, price):
         if balance <= 0 or price <= 0:
             return 0.0
-        # 100% बैलेंस का उपयोग करके क्वांटिटी निकालना
         notional_value = balance * leverage
         raw_lot = notional_value / price
         return round(raw_lot, 4)
 
     def place_limit_order(self, symbol, lot, price, side):
-        """डेल्टा एक्सचेंज पर असली लिमिट ऑर्डर (Maker) प्लेस करना"""
         try:
             logging.info(f"PLACING REAL LIMIT ORDER: Symbol={symbol}, Side={side}, Lot={lot}, Price={price}")
             order = exchange.create_order(
@@ -167,7 +163,7 @@ class PrimeScalpVerifiedBot:
                 side=side.lower(),
                 amount=lot,
                 price=price,
-                params={'postOnly': True} # Maker Order नियम के लिए
+                params={'postOnly': True}
             )
             logging.info(f"Order Placed Successfully: {order['id']}")
             return True
@@ -252,7 +248,7 @@ class PrimeScalpVerifiedBot:
 
     def run_trading_loop(self):
         logging.info("Starting 24/7 Live Delta Trading Loop...")
-        send_telegram_alert("🟢 Prime Scalp Live Bot successfully started with Real Delta API!")
+        send_telegram_alert("🟢 Prime Scalp Live Bot successfully started with fixed .env path!")
         
         while True:
             try:
@@ -300,7 +296,6 @@ class PrimeScalpVerifiedBot:
                             logging.info(alert_msg)
                             send_telegram_alert(alert_msg)
 
-                # हर 2 मिनट पर सटीक लूप चेकिंग
                 time.sleep(120)
 
             except Exception as e:
